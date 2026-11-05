@@ -1,0 +1,163 @@
+// An Eider TLS server for tests/interop.sh: serves one connection on 127.0.0.1:<port>, reads
+// an HTTP/1.0-style request, and answers with the connection's properties.
+//
+//   interop_server <port> <chain.pem> <key.pem> [options]
+//
+// options: alpn=<proto>[,<proto>] suites=<aes128|aes256|chacha> groups=<x25519|p256>
+//          clientca=<ca.pem> (request a client certificate) require=1 (and insist on one)
+
+import std.bytes
+import std.env
+import std.fs
+import std.io
+import std.net
+import std.stream
+import std.strings
+import std.time
+import std.utf8
+import tls.alert
+import tls.config
+import tls.conn
+import tls.handshake
+import tls.server
+import tls.suite
+import tls.x509
+
+fn arg(i: usize) -> String uses io {
+    let a = env.args()
+    if i < a.len() { return utf8.lossy(a[i].copy()) }
+    String.from("")
+}
+
+fn opt(name: str) -> Option[String] uses io {
+    let a = env.args()
+    let mut prefix = String.from(name)
+    prefix.push_str("=")
+    let mut i: usize = 4
+    while i < a.len() {
+        let s = utf8.lossy(a[i].copy())
+        if strings.starts_with(s, prefix) {
+            return strings.strip_prefix(s, prefix)
+        }
+        i += 1
+    }
+    None
+}
+
+fn main() uses io, fs, net, clock {
+    let port = strings.parse_i64(arg(1)).unwrap() as i32
+    let id = config.identity_from_files(arg(2), arg(3)).unwrap()
+    let mut cfg = config.server_config(id)
+    match opt("alpn") {
+        Some(a) => {
+            for p in strings.split(a, ",") { cfg.alpn.push(p.bytes()) }
+        }
+        None => {}
+    }
+    match opt("suites") {
+        Some(s) => {
+            cfg.suites = List.new()
+            if s == String.from("aes128") { cfg.suites.push(suite.Aes128GcmSha256) }
+            if s == String.from("aes256") { cfg.suites.push(suite.Aes256GcmSha384) }
+            if s == String.from("chacha") { cfg.suites.push(suite.ChaCha20Poly1305Sha256) }
+        }
+        None => {}
+    }
+    match opt("groups") {
+        Some(g) => {
+            cfg.groups = List.new()
+            if g == String.from("x25519") { cfg.groups.push(handshake.GROUP_X25519) }
+            if g == String.from("p256") { cfg.groups.push(handshake.GROUP_SECP256R1) }
+        }
+        None => {}
+    }
+    match opt("clientca") {
+        Some(f) => {
+            let store = x509.store_from_pem(fs.read(f.bytes()).unwrap()).unwrap()
+            match opt("require") {
+                Some(_) => { cfg.client_auth = config.RequireClientAuth(store) }
+                None => { cfg.client_auth = config.RequestClientAuth(store) }
+            }
+        }
+        None => {}
+    }
+    let l = net.listener(net.ipv4(127, 0, 0, 1, port), false).unwrap()
+    io.outln("listening".bytes())
+    let a = stream.accept_by(l, time.after_ms(20000)).unwrap()
+    let mut c = match server.accept(a.fd, cfg, time.after_ms(10000)) {
+        Ok(c) => c
+        Err(e) => {
+            io.outln("handshake failed: {e}".bytes())
+            env.exit(2)
+            return
+        }
+    }
+    let mut req: List[u8] = List.new()
+    while bytes.find(req, "\r\n\r\n".bytes(), 0).is_none() {
+        match c.recv_by(16384, time.after_ms(5000)) {
+            Ok(b) => {
+                if b.len() == 0 { break }
+                bytes.append(inout req, b)
+            }
+            Err(e) => {
+                io.outln("read failed: {e}".bytes())
+                env.exit(4)
+            }
+        }
+    }
+    let cs = suite.name(c.cipher_suite())
+    let mut body = String.from("hello from eider tls\n")
+    body.push_str("suite ")
+    body.push_str(cs)
+    body.push_str("\n")
+    match c.negotiated_alpn() {
+        Some(p) => {
+            body.push_str("alpn ")
+            body.append(utf8.lossy(p))
+            body.push_str("\n")
+        }
+        None => {}
+    }
+    match c.server_name {
+        Some(n) => {
+            body.push_str("sni ")
+            body.append(utf8.lossy(n))
+            body.push_str("\n")
+        }
+        None => {}
+    }
+    let nc = c.peer_certificates().len()
+    let line: String = "client certificates {nc}\n"
+    body.append(line)
+    if c.retried { body.push_str("hello retry\n") }
+    let mut resp = "HTTP/1.0 200 OK\r\n\r\n".bytes()
+    bytes.append(inout resp, body.bytes())
+    match opt("rekey") {
+        Some(_) => {
+            // many small writes with a key update before each
+            c.rekey_after = 1
+            let mut at: usize = 0
+            while at < resp.len() {
+                let stop = if at + 10 < resp.len() { at + 10 } else { resp.len() }
+                match c.send_by(bytes.slice(resp, at, stop), time.after_ms(5000)) {
+                    Ok(_) => {}
+                    Err(e) => io.outln("write failed: {e}".bytes())
+                }
+                at = stop
+            }
+            let ku = c.key_updates_sent
+            io.outln("key updates sent {ku}".bytes())
+        }
+        None => {
+            match c.send_by(resp, time.after_ms(5000)) {
+                Ok(_) => {}
+                Err(e) => io.outln("write failed: {e}".bytes())
+            }
+        }
+    }
+    let r = c.close()
+    // wait for the peer's close_notify
+    let tail = c.recv_by(16384, time.after_ms(2000))
+    io.outln("served {cs}".bytes())
+    let z = a.fd.close()
+}

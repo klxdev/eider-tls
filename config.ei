@@ -52,7 +52,7 @@ fn leaf_key_is(leaf: x509.Cert, kind: x509.KeyKind, pubkey: List[u8]) -> bool {
 }
 
 /// Reads an identity from two files.
-pub fn identity_from_files(chain_path: str, key_path: str) -> Result[Identity, String] uses fs {
+pub fn identity_from_files(chain_path: String, key_path: String) -> Result[Identity, String] uses fs {
     let c = fs.read(chain_path.bytes())?
     let k = fs.read(key_path.bytes())?
     identity_from_pem(c, k)

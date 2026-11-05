@@ -169,6 +169,7 @@ fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.Clie
         } else {
             if retried { return Err(alert.protocol(alert.UnexpectedMessage, "a second HelloRetryRequest")) }
             retried = true
+            c.retried = true
             hrr_suite = Some(chosen)
             // the HelloRetryRequest must ask for something: a group or a cookie
             if sh.selected_group.is_none() && sh.cookie.is_none() {

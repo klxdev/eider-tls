@@ -136,6 +136,7 @@ fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.Serv
             None => return Err(alert.protocol(alert.HandshakeFailure, "no key exchange group in common"))
         }
         // HelloRetryRequest: ask for a share for `g`
+        c.retried = true
         let hrr = handshake.server_hello(handshake.ServerHello(handshake.hrr_random(), ch.session_id, suite.code(chosen), handshake.TLS13, None, Some(g), None, true))
         tr = match keys.restart_for_retry(tr, h) {
             Ok(t) => t
