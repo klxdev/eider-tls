@@ -1,0 +1,44 @@
+== a server fed
+the good ClientHello then end of stream: tls: connection closed without close_notify
+every prefix (167 of them): 167 rejected, 0 accepted
+400 damaged ClientHellos: 400 rejected, 0 accepted
+150 random byte strings: 150 rejected, 0 accepted
+plain HTTP: tls: unknown record type (sent alert unexpected_message)
+an SSLv2 ClientHello: tls: unknown record type (sent alert unexpected_message)
+a record header, a huge length, then silence: tls: record too long (sent alert record_overflow)
+a record of 16 KiB + 1: tls: record too long (sent alert record_overflow)
+a ClientHello that offers only TLS 1.2: tls: the client does not offer TLS 1.3 (sent alert protocol_version)
+a ClientHello in 1-byte records, then end of stream: tls: connection closed without close_notify
+a ClientHello then a forged protected record: tls: bad record MAC (sent alert bad_record_mac)
+a ClientHello then a plaintext Finished: tls: unprotected record after the keys changed (sent alert unexpected_message)
+a ClientHello then a fatal alert: tls: unprotected record after the keys changed (sent alert unexpected_message)
+a record of an unknown type: tls: unknown record type (sent alert unexpected_message)
+a change_cipher_spec first: tls: connection closed without close_notify
+an empty handshake record: tls: empty record (sent alert unexpected_message)
+== a client fed
+a fatal alert (handshake_failure): tls: the peer sent an alert (alert handshake_failure)
+close_notify: tls: the peer closed the connection during the handshake
+an alert of the wrong length: tls: malformed alert (sent alert decode_error)
+end of stream: tls: connection closed without close_notify
+a ServerHello for TLS 1.2: tls: the server did not negotiate TLS 1.3 (sent alert protocol_version)
+a ServerHello without supported_versions: tls: the server did not negotiate TLS 1.3 (sent alert protocol_version)
+a ServerHello for TLS 1.1: tls: the server did not negotiate TLS 1.3 (sent alert protocol_version)
+a ServerHello that does not echo the session id: tls: the server did not echo legacy_session_id (sent alert illegal_parameter)
+a cipher suite that was not offered: tls: the server chose a cipher suite we did not offer (sent alert illegal_parameter)
+a TLS 1.3 suite that was not offered: tls: the server chose a cipher suite we did not offer (sent alert illegal_parameter)
+no key share: tls: ServerHello has no key_share (sent alert missing_extension)
+a key share for a group that was not sent: tls: the server chose a group we sent no share for (sent alert illegal_parameter)
+a short X25519 share: tls: malformed key share (sent alert illegal_parameter)
+an all-zero X25519 share: tls: invalid key share (sent alert illegal_parameter)
+a ServerHello, then a plaintext Certificate: tls: unprotected record after the keys changed (sent alert unexpected_message)
+a ServerHello, then a forged protected record: tls: bad record MAC (sent alert bad_record_mac)
+a ServerHello, then a change_cipher_spec, then a forged record: tls: bad record MAC (sent alert bad_record_mac)
+a ServerHello, then three change_cipher_spec records: tls: too many change_cipher_spec records (sent alert unexpected_message)
+two HelloRetryRequests: tls: a second HelloRetryRequest (sent alert unexpected_message)
+a HelloRetryRequest that asks for nothing: tls: empty HelloRetryRequest (sent alert illegal_parameter)
+a HelloRetryRequest for the group already sent: tls: HelloRetryRequest asks for a group we already sent (sent alert illegal_parameter)
+a HelloRetryRequest for an unknown group: tls: HelloRetryRequest names a group we did not offer (sent alert illegal_parameter)
+a handshake message of 16 MB: tls: handshake message too large (sent alert illegal_parameter)
+a message that is not a ServerHello: tls: expected ServerHello (sent alert unexpected_message)
+application data before the handshake: tls: unexpected record type (sent alert unexpected_message)
+300 damaged ServerHellos: 300 rejected, 0 connected

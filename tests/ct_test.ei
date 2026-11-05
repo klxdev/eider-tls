@@ -1,0 +1,89 @@
+// The comparison helpers for secrets (tls.ct): they give the right answers on every edge,
+// and their running time does not depend on where two values differ. A branch on the data
+// (an early exit at the first different byte) would make the first-byte case thousands of
+// times faster than the last-byte case on 64 KiB values; the check allows a factor of 4.
+
+import std.io
+import std.time
+import tls.ct
+
+fn filled(n: usize, v: u8) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < n {
+        out.push(v)
+        i += 1
+    }
+    out
+}
+
+fn yn(b: bool) -> str { if b { "yes" } else { "no" } }
+
+fn timing(name: str, f: fn(List[u8], List[u8]) -> bool) uses io, clock {
+    let a = filled(65536, 7)
+    let mut early = a.copy()
+    early[0] = 8
+    let mut late = a.copy()
+    late[65535] = 8
+    let mut best_early: i64 = 9223372036854775807
+    let mut best_late: i64 = 9223372036854775807
+    let mut round: u32 = 0
+    while round < 7 {
+        let t0 = time.mono_ns()
+        let mut k = 0
+        let mut hits = 0
+        while k < 40 {
+            if f(a, early) { hits += 1 }
+            k += 1
+        }
+        let t1 = time.mono_ns()
+        k = 0
+        while k < 40 {
+            if f(a, late) { hits += 1 }
+            k += 1
+        }
+        let t2 = time.mono_ns()
+        if t1 - t0 < best_early { best_early = t1 - t0 }
+        if t2 - t1 < best_late { best_late = t2 - t1 }
+        round += 1
+    }
+    let lo = if best_early < best_late { best_early } else { best_late }
+    let hi = if best_early < best_late { best_late } else { best_early }
+    let steady = hi < lo * 4
+    if steady {
+        print("timing {name}: same for a difference at the start and at the end")
+    } else {
+        print("timing {name}: FAIL early {best_early} ns, late {best_late} ns")
+    }
+}
+
+fn main() uses io, clock {
+    let a = filled(32, 1)
+    let mut b = a.copy()
+    print("equal: {yn(ct.eq(a, b))} {yn(ct.eq_pure(a, b))}")
+    b[0] = 2
+    print("first byte differs: {yn(ct.eq(a, b))} {yn(ct.eq_pure(a, b))}")
+    b = a.copy()
+    b[31] = 2
+    print("last byte differs: {yn(ct.eq(a, b))} {yn(ct.eq_pure(a, b))}")
+    b = a.copy()
+    b[31] = 0
+    print("last byte differs by one bit: {yn(ct.eq(a, b))} {yn(ct.eq_pure(a, b))}")
+    print("shorter: {yn(ct.eq(a, filled(31, 1)))} {yn(ct.eq_pure(a, filled(31, 1)))}")
+    print("longer: {yn(ct.eq(a, filled(33, 1)))} {yn(ct.eq_pure(a, filled(33, 1)))}")
+    print("both empty: {yn(ct.eq(List.new(), List.new()))} {yn(ct.eq_pure(List.new(), List.new()))}")
+    print("all zero: {yn(ct.all_zero(filled(16, 0)))} {yn(ct.all_zero(filled(16, 1)))} {yn(ct.all_zero(List.new()))}")
+    let mut z = filled(16, 0)
+    z[15] = 128
+    print("all zero, high bit in the last byte: {yn(ct.all_zero(z))}")
+    let vals: [u32; 8] = [0, 1, 2, 255, 65535, 2147483647, 2147483648, 4294967295]
+    for v in vals {
+        let nz = ct.nonzero(v)
+        let m = ct.mask_eq(v, 255)
+        let l = ct.mask_lt(v, 1000)
+        let s = ct.select(m, 11, 22)
+        print("{v}: nonzero {nz} eq255 {m} lt1000 {l} select {s}")
+    }
+    timing("ct.eq (CRYPTO_memcmp)", ct.eq)
+    timing("ct.eq_pure", ct.eq_pure)
+}

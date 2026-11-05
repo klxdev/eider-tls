@@ -1,0 +1,75 @@
+== real certificates, damaged
+ed.pem: 440 bytes; prefixes parsed 0; of 1320 one-byte changes 866 still parse; of 880 insertions/deletions 0 parse; trailing byte parses no
+ec.pem: 497 bytes; prefixes parsed 0; of 1491 one-byte changes 1004 still parse; of 994 insertions/deletions 0 parse; trailing byte parses no
+root.pem: 383 bytes; prefixes parsed 0; of 1149 one-byte changes 785 still parse; of 766 insertions/deletions 0 parse; trailing byte parses no
+inter.pem: 376 bytes; prefixes parsed 0; of 1128 one-byte changes 743 still parse; of 752 insertions/deletions 0 parse; trailing byte parses no
+== DER rules
+empty: rejected
+tag only: rejected
+zero length: element tag 48, content 0 bytes
+short form: element tag 4, content 1 bytes
+short form, content missing: rejected
+indefinite length: rejected
+long form for a short length: rejected
+long form, 2 bytes, minimal: rejected
+length with a leading zero byte: rejected
+length of 2^32 - 1: rejected
+length of 5 bytes: rejected
+length 128 declared, 1 present: rejected
+multi-byte tag: rejected
+high tag number form: rejected
+nested overrun: element tag 48, content 3 bytes
+== times
+time 250101000000Z: 1735689600
+time 490101000000Z: 2493072000
+time 500101000000Z: -631152000
+time 20250101000000Z: 1735689600
+time 99991231235959Z: 253402300799
+time 240229000000Z: 1709164800
+time 230229000000Z: rejected
+time 250101000000+0100: rejected
+time 2501010000Z: rejected
+time 251301000000Z: rejected
+time 250132000000Z: rejected
+time 250101240000Z: rejected
+time 250101006000Z: rejected
+time 25010100000aZ: rejected
+time 2025010100000Z: rejected
+time 20250101000000.5Z: rejected
+time 250101000000Z: rejected
+== integers and booleans
+INTEGER 020100: Some(0)
+INTEGER 02020080: Some(128)
+INTEGER 0202007f: None
+INTEGER 02020001: None
+INTEGER 0200: None
+INTEGER 02028000: None
+INTEGER 0205ffffffffff: None
+INTEGER 02050100000000: None
+INTEGER 020500ffffffff: None
+BOOLEAN 0101ff: Some(true)
+BOOLEAN 010100: Some(false)
+BOOLEAN 010101: None
+BOOLEAN 0102ffff: None
+BOOLEAN 0100: None
+== nesting and garbage
+20000 nested headers: no
+random garbage, 800 inputs: 0 parsed
+== PEM
+one block: 1
+empty text: 0
+text without blocks: 0
+two blocks: 2
+CRLF line ends: 1
+no END line: false
+a character outside base64: false
+mismatched END label: false
+BEGIN without dashes: false
+5000 blocks: false
+encode then decode: true
+== key files
+Ed25519 PKCS#8: true
+EC SEC1: true
+certificate is not a key: false
+Ed25519 key: prefixes and byte changes that still load: 32
+EC key: prefixes and byte changes that still load: 104

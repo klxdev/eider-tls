@@ -24,10 +24,10 @@ pub fn mask_eq(a: u32, b: u32) -> u32 {
     zero -% (1 -% nonzero(a ^ b))
 }
 
-/// 0xffffffff if `a < b`, else 0 (for values below 2^31).
+/// 0xffffffff if `a < b`, else 0 (any two u32 values; Hacker's Delight 2-12).
 pub fn mask_lt(a: u32, b: u32) -> u32 {
     let zero: u32 = 0
-    zero -% ((a -% b) >> 31)
+    zero -% ((a ^ ((a ^ b) | ((a -% b) ^ b))) >> 31)
 }
 
 /// `a` where `mask` is all ones, else `b`.

@@ -1,0 +1,95 @@
+default: Ed25519 leaf via intermediate, X25519, AES-128-GCM
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+AES-256-GCM
+  client: connected TLS_AES_256_GCM_SHA384 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_256_GCM_SHA384 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+ChaCha20-Poly1305
+  client: connected TLS_CHACHA20_POLY1305_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_CHACHA20_POLY1305_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+secp256r1 key exchange
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+ECDSA P-256 leaf
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+HelloRetryRequest
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=true
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=true
+HelloRetryRequest the other way
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=true
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=true
+no group in common
+  client: handshake failed: tls: the peer rejected the connection
+  server: handshake failed: tls: no key exchange group in common (sent alert handshake_failure)
+no cipher suite in common
+  client: handshake failed: tls: the peer rejected the connection
+  server: handshake failed: tls: no cipher suite in common (sent alert handshake_failure)
+ALPN: the server's preference wins
+  client: connected TLS_AES_128_GCM_SHA256 alpn=h2 reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=h2 sni=localhost peer_certs=0 key_updates_in=0 retried=false
+ALPN: nothing in common
+  client: handshake failed: tls: the peer rejected the connection
+  server: handshake failed: tls: no application protocol in common (sent alert no_application_protocol)
+ALPN: the client offers none
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+client certificate (Ed25519), required
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=1 key_updates_in=0 retried=false
+client certificate required, none configured
+  client: read failed: tls: the peer rejected the connection
+  server: handshake failed: tls: the client sent no certificate (sent alert certificate_required)
+client certificate requested, none configured
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+client certificate from an untrusted CA
+  client: read failed: tls: the peer rejected the connection
+  server: handshake failed: tls: unable to find a trusted issuer (sent alert unknown_ca)
+wrong host name
+  client: handshake failed: tls: certificate is not valid for the host name (sent alert bad_certificate)
+  server: handshake failed: tls: the peer rejected the connection
+IP address in the certificate
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=- peer_certs=0 key_updates_in=0 retried=false
+wildcard name
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=a.example.test peer_certs=0 key_updates_in=0 retried=false
+untrusted root
+  client: handshake failed: tls: unable to find a trusted issuer (sent alert unknown_ca)
+  server: handshake failed: tls: the peer rejected the connection
+expired certificate
+  client: handshake failed: tls: certificate has expired (sent alert certificate_expired)
+  server: handshake failed: tls: the peer rejected the connection
+the clock is after the validity
+  client: handshake failed: tls: certificate has expired (sent alert certificate_expired)
+  server: handshake failed: tls: the peer rejected the connection
+verification switched off
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+missing intermediate
+  client: handshake failed: tls: unable to find a trusted issuer (sent alert unknown_ca)
+  server: handshake failed: tls: the peer rejected the connection
+no server_name with verification on
+  client: handshake failed: tls: config: server_name is required to verify the certificate
+  server: handshake failed: tls: connection closed without close_notify
+key update before every record (both sides)
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=2 out=2 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=2 retried=false
+the client asks for a key update
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=1 out=1 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=1 retried=false
+3 MB each way
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+empty request
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+truncation
+  first read: Ok([112, 97, 114, 116, 105, 97, 108])
+  second read: tls: connection closed without close_notify
+  write after failure: tls: the peer rejected the connection
+silent peer
+  client: tls: read: timed out
+  server: tls: read: timed out
+flipped bits: 700 tried, 2 accepted at offsets: 2 129

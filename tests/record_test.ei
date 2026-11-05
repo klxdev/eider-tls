@@ -1,0 +1,191 @@
+// The record layer: protection under each suite, the sequence number in the nonce, padding,
+// every way a record can be altered, the size limits and the framing of partial input.
+
+import std.bytes
+import std.io
+import crypto
+import tls.alert
+import tls.record
+import tls.suite
+import tls.wire
+
+fn secret(h: crypto.Hash, fill: u8) -> crypto.Prk {
+    let mut b: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < crypto.hash_len(h) {
+        b.push(fill)
+        i += 1
+    }
+    crypto.prk(h, b).unwrap()
+}
+
+fn prot(s: suite.Suite, fill: u8) -> record.Protector {
+    record.protector(s, secret(suite.hash(s), fill)).unwrap()
+}
+
+fn err_text(e: alert.Error) -> String {
+    let mut m = String.from("")
+    e.show(inout m)
+    m
+}
+
+fn open_text(r: Result[record.Opened, alert.Error]) -> String {
+    match r {
+        Ok(o) => {
+            let n = o.data.len()
+            let t = o.ctype
+            "ok type {t} {n} bytes"
+        }
+        Err(e) => err_text(e)
+    }
+}
+
+fn split(rec: List[u8]) -> (List[u8], List[u8]) {
+    (wire.slice(rec, 0, 5), wire.slice(rec, 5, rec.len()))
+}
+
+fn suite_case(s: suite.Suite) uses io {
+    let name = suite.name(s)
+    print("== {name}")
+    let mut w = prot(s, 1)
+    let mut r = prot(s, 1)
+    let msg = "hello, record layer".bytes()
+    let rec = record.seal(inout w, record.APPLICATION_DATA, msg, 0).unwrap()
+    let n = rec.len()
+    print("sealed length {n} (5 + {msg.len()} + 1 + 16)")
+    print("header {rec[0]} {rec[1]} {rec[2]}")
+    let (h, body) = split(rec)
+    let o = record.open(inout r, h, body).unwrap()
+    print("round trip: {bytes.eq(o.data, msg)} type {o.ctype}")
+    // the second record uses sequence number 1, so the same plaintext differs
+    let rec2 = record.seal(inout w, record.HANDSHAKE, msg, 0).unwrap()
+    print("same plaintext, next record, different bytes: {!bytes.eq(rec, rec2)}")
+    let (h2, b2) = split(rec2)
+    print("in order: {open_text(record.open(inout r, h2, b2))}")
+    // replaying the first record now fails (the read side is at sequence 2)
+    let mut r2 = prot(s, 1)
+    let (h1, b1) = split(rec)
+    let first = record.open(inout r2, h1, b1)
+    print("replay at the wrong sequence number: {open_text(record.open(inout r2, h1, b1))}")
+    // padding is removed
+    let mut w3 = prot(s, 2)
+    let mut r3 = prot(s, 2)
+    let padded = record.seal(inout w3, record.APPLICATION_DATA, msg, 100).unwrap()
+    let pn = padded.len()
+    print("padded length {pn}")
+    let (ph, pb) = split(padded)
+    print("padded: {open_text(record.open(inout r3, ph, pb))}")
+    // every byte of the record altered, one bit at a time: always bad_record_mac
+    let mut w4 = prot(s, 3)
+    let rec4 = record.seal(inout w4, record.APPLICATION_DATA, msg, 0).unwrap()
+    let mut accepted = 0
+    let mut rejected = 0
+    let mut i: usize = 0
+    while i < rec4.len() {
+        let mut bad = rec4.copy()
+        bad[i] = bad[i] ^ 1
+        let mut rr = prot(s, 3)
+        let (bh, bb) = split(bad)
+        // the length bytes also change the AAD or the framing; open() is called with what the framing would hand it
+        let res = record.open(inout rr, bh, bb)
+        match res {
+            Ok(_) => { accepted += 1 }
+            Err(_) => { rejected += 1 }
+        }
+        i += 1
+    }
+    print("one bit flipped in each of {rec4.len()} bytes: {accepted} accepted, {rejected} rejected")
+    // wrong key
+    let mut rw = prot(s, 4)
+    let (h4, b4) = split(rec4)
+    print("wrong key: {open_text(record.open(inout rw, h4, b4))}")
+    // key update: the new keys differ, the sequence number restarts
+    let mut wk = prot(s, 5)
+    let mut rk = prot(s, 5)
+    let before = record.seal(inout wk, record.APPLICATION_DATA, msg, 0).unwrap()
+    let (hb, bb2) = split(before)
+    let ob = record.open(inout rk, hb, bb2).unwrap()
+    record.rekey(inout wk).unwrap()
+    record.rekey(inout rk).unwrap()
+    let after = record.seal(inout wk, record.APPLICATION_DATA, msg, 0).unwrap()
+    print("after rekey the sequence number is {wk.seq}")
+    let (ha, ba) = split(after)
+    print("after rekey: {open_text(record.open(inout rk, ha, ba))}")
+    let mut stale = prot(s, 5)
+    let (ha2, ba2) = split(after)
+    print("old keys cannot open it: {open_text(record.open(inout stale, ha2, ba2))}")
+}
+
+fn main() uses io {
+    suite_case(suite.Aes128GcmSha256)
+    suite_case(suite.Aes256GcmSha384)
+    suite_case(suite.ChaCha20Poly1305Sha256)
+
+    print("== limits")
+    let mut w = prot(suite.Aes128GcmSha256, 9)
+    let mut big: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < 16385 {
+        big.push(1)
+        i += 1
+    }
+    match record.seal(inout w, record.APPLICATION_DATA, big, 0) {
+        Ok(_) => print("17 KiB fragment sealed?")
+        Err(e) => print("fragment of 16385 bytes: {err_text(e)}")
+    }
+    let full = wire.slice(big, 0, 16384)
+    let r16 = record.seal(inout w, record.APPLICATION_DATA, full, 0).unwrap()
+    print("fragment of 16384 bytes: record of {r16.len()} bytes")
+    let mut rr = prot(suite.Aes128GcmSha256, 9)
+    let (hh, bbd) = split(r16)
+    print("open: {open_text(record.open(inout rr, hh, bbd))}")
+    // inner plaintext of zeros only
+    let mut w0 = prot(suite.Aes128GcmSha256, 7)
+    let hdr = record.header(record.APPLICATION_DATA, 17 + 16)
+    let n0 = crypto.nonce_for_sequence(w0.iv, 0)
+    let sealed0 = crypto.seal(w0.key, n0, hdr, wire.zeros(17)).unwrap()
+    let mut r0 = prot(suite.Aes128GcmSha256, 7)
+    print("all-zero inner plaintext: {open_text(record.open(inout r0, hdr, sealed0))}")
+    // too short to hold a tag
+    let mut rs = prot(suite.Aes128GcmSha256, 7)
+    print("body of 16 bytes: {open_text(record.open(inout rs, record.header(23, 16), wire.zeros(16)))}")
+    print("body of 17 bytes: {open_text(record.open(inout rs, record.header(23, 17), wire.zeros(17)))}")
+    print("body over 2^14 + 256: {open_text(record.open(inout rs, record.header(23, 16641), wire.zeros(16641)))}")
+
+    print("== framing")
+    let rec = record.plain(record.HANDSHAKE, "abc".bytes())
+    let mut k: usize = 0
+    while k < rec.len() {
+        match record.parse(wire.slice(rec, 0, k), 0, 16384) {
+            record.NeedMore(t) => print("{k} bytes: need {t}")
+            record.Record(_, _, _, _) => print("{k} bytes: record?")
+            record.Bad(a, why) => print("{k} bytes: bad {why}")
+        }
+        k += 1
+    }
+    match record.parse(rec, 0, 16384) {
+        record.Record(t, h, b, used) => print("whole: type {t} body {b.len()} used {used}")
+        record.NeedMore(t) => print("whole: need more?")
+        record.Bad(a, why) => print("whole: bad {why}")
+    }
+    // two records back to back
+    let mut two = rec.copy()
+    bytes.append(inout two, record.plain(record.ALERT, "xy".bytes()))
+    match record.parse(two, rec.len(), 16384) {
+        record.Record(t, h, b, used) => print("second: type {t} body {b.len()} used {used}")
+        record.NeedMore(t) => print("second: need more?")
+        record.Bad(a, why) => print("second: bad {why}")
+    }
+    let hdrs: [str; 6] = ["99 3 3 0 1", "22 3 3 255 255", "22 2 3 0 1", "22 4 0 0 1", "22 3 9 0 1", "22 3 1 0 1"]
+    for line in hdrs {
+        let parts = bytes.split(line.bytes(), 32)
+        let mut h: List[u8] = List.new()
+        for p in parts { h.push(bytes.parse_u64(p).unwrap() as u8) }
+        h.push(0)
+        match record.parse(h, 0, 16384) {
+            record.NeedMore(t) => print("header {line}: need {t}")
+            record.Record(_, _, _, _) => print("header {line}: record")
+            record.Bad(a, why) => print("header {line}: {why}")
+        }
+    }
+}

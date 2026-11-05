@@ -213,6 +213,14 @@ pub fn send[S: stream.Reader + stream.Writer](inout c: Conn[S], ctype: u8, data:
     while at < n {
         let stop = if n - at > record.MAX_PLAINTEXT { at + record.MAX_PLAINTEXT } else { n }
         let chunk = wire.slice(data, at, stop)
+        // the keys change before they have sealed `rekey_after` records
+        if c.done && ctype == record.APPLICATION_DATA && c.wr.seq >= c.rekey_after {
+            if out.len() > 0 {
+                write_out(inout c, out, dl)?
+                out = List.new()
+            }
+            send_key_update(inout c, false, dl)?
+        }
         if c.wr_on {
             out.extend(record.seal(inout c.wr, ctype, chunk, 0)?)
         } else {
@@ -401,15 +409,13 @@ impl[S: stream.Reader + stream.Writer] Conn[S] {
 }
 
 fn send_app[S: stream.Reader + stream.Writer](inout c: Conn[S], data: List[u8], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
-    if c.wr.seq >= c.rekey_after { send_key_update(inout c, false, dl)? }
-    // large writes are sealed in slices so the keys can change between them
+    // large writes are sealed in slices so memory stays bounded
     let mut at: usize = 0
     let n = data.len()
     while at < n {
         let stop = if n - at > 1048576 { at + 1048576 } else { n }
         send(inout c, record.APPLICATION_DATA, wire.slice(data, at, stop), dl)?
         at = stop
-        if at < n && c.wr.seq >= c.rekey_after { send_key_update(inout c, false, dl)? }
     }
     Ok(())
 }

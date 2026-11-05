@@ -1,0 +1,19 @@
+equal: yes yes
+first byte differs: no no
+last byte differs: no no
+last byte differs by one bit: no no
+shorter: no no
+longer: no no
+both empty: yes yes
+all zero: yes no yes
+all zero, high bit in the last byte: no
+0: nonzero 0 eq255 0 lt1000 4294967295 select 22
+1: nonzero 1 eq255 0 lt1000 4294967295 select 22
+2: nonzero 1 eq255 0 lt1000 4294967295 select 22
+255: nonzero 1 eq255 4294967295 lt1000 4294967295 select 11
+65535: nonzero 1 eq255 0 lt1000 0 select 22
+2147483647: nonzero 1 eq255 0 lt1000 0 select 22
+2147483648: nonzero 1 eq255 0 lt1000 0 select 22
+4294967295: nonzero 1 eq255 0 lt1000 0 select 22
+timing ct.eq (CRYPTO_memcmp): same for a difference at the start and at the end
+timing ct.eq_pure: same for a difference at the start and at the end

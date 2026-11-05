@@ -1,0 +1,67 @@
+== TLS_AES_128_GCM_SHA256
+sealed length 41 (5 + 19 + 1 + 16)
+header 23 3 3
+round trip: true type 23
+same plaintext, next record, different bytes: true
+in order: ok type 22 19 bytes
+replay at the wrong sequence number: tls: bad record MAC (sent alert bad_record_mac)
+padded length 141
+padded: ok type 23 19 bytes
+one bit flipped in each of 41 bytes: 0 accepted, 41 rejected
+wrong key: tls: bad record MAC (sent alert bad_record_mac)
+after rekey the sequence number is 1
+after rekey: ok type 23 19 bytes
+old keys cannot open it: tls: bad record MAC (sent alert bad_record_mac)
+== TLS_AES_256_GCM_SHA384
+sealed length 41 (5 + 19 + 1 + 16)
+header 23 3 3
+round trip: true type 23
+same plaintext, next record, different bytes: true
+in order: ok type 22 19 bytes
+replay at the wrong sequence number: tls: bad record MAC (sent alert bad_record_mac)
+padded length 141
+padded: ok type 23 19 bytes
+one bit flipped in each of 41 bytes: 0 accepted, 41 rejected
+wrong key: tls: bad record MAC (sent alert bad_record_mac)
+after rekey the sequence number is 1
+after rekey: ok type 23 19 bytes
+old keys cannot open it: tls: bad record MAC (sent alert bad_record_mac)
+== TLS_CHACHA20_POLY1305_SHA256
+sealed length 41 (5 + 19 + 1 + 16)
+header 23 3 3
+round trip: true type 23
+same plaintext, next record, different bytes: true
+in order: ok type 22 19 bytes
+replay at the wrong sequence number: tls: bad record MAC (sent alert bad_record_mac)
+padded length 141
+padded: ok type 23 19 bytes
+one bit flipped in each of 41 bytes: 0 accepted, 41 rejected
+wrong key: tls: bad record MAC (sent alert bad_record_mac)
+after rekey the sequence number is 1
+after rekey: ok type 23 19 bytes
+old keys cannot open it: tls: bad record MAC (sent alert bad_record_mac)
+== limits
+fragment of 16385 bytes: tls: record fragment too large (sent alert internal_error)
+fragment of 16384 bytes: record of 16406 bytes
+open: ok type 23 16384 bytes
+all-zero inner plaintext: tls: record with no content type (sent alert unexpected_message)
+body of 16 bytes: tls: protected record too short (sent alert decode_error)
+body of 17 bytes: tls: bad record MAC (sent alert bad_record_mac)
+body over 2^14 + 256: tls: record too long (sent alert record_overflow)
+== framing
+0 bytes: need 5
+1 bytes: need 5
+2 bytes: need 5
+3 bytes: need 5
+4 bytes: need 5
+5 bytes: need 8
+6 bytes: need 8
+7 bytes: need 8
+whole: type 22 body 3 used 8
+second: type 21 body 2 used 7
+header 99 3 3 0 1: unknown record type
+header 22 3 3 255 255: record too long
+header 22 2 3 0 1: not a TLS record
+header 22 4 0 0 1: not a TLS record
+header 22 3 9 0 1: not a TLS record
+header 22 3 1 0 1: record

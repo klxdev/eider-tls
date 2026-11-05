@@ -1,0 +1,74 @@
+// The key schedule (RFC 8446 section 7) against tests/vectors/keysched.py, which computes the
+// same values with Python's hmac and hashlib. The output must equal tests/keys_test.out.
+
+import std.bytes
+import std.io
+import crypto
+import tls.keys
+import tls.suite
+import tls.wire
+
+fn hx(b: List[u8]) -> String { bytes_to_string(bytes.hex(b)) }
+
+fn bytes_to_string(b: List[u8]) -> String {
+    let mut s = String.from("")
+    for c in b { s.push_byte(c) }
+    s
+}
+
+fn show(name: str, b: List[u8]) uses io {
+    let h = hx(b)
+    print("{name} {h}")
+}
+
+fn run(title: str, s: suite.Suite) uses io {
+    print("== {title}")
+    let h = suite.hash(s)
+    let hl = crypto.hash_len(h)
+    let mut ecdhe: List[u8] = List.new()
+    let mut i: u32 = 0
+    while i < 32 {
+        ecdhe.push(i as u8)
+        i += 1
+    }
+    let early = keys.early_secret(h).unwrap()
+    show("early", early.bytes)
+    let empty = crypto.digest(h, List.new()).unwrap()
+    let d1 = keys.derive_secret(early, "derived", empty).unwrap()
+    show("derived", d1.bytes)
+    let hs = keys.handshake_secret(early, ecdhe).unwrap()
+    show("handshake", hs.bytes)
+    let mut t1 = keys.transcript(h)
+    keys.add(inout t1, "client hello|server hello".bytes())
+    let th1 = keys.hash(t1).unwrap()
+    let c_hs = keys.derive_secret(hs, "c hs traffic", th1).unwrap()
+    let s_hs = keys.derive_secret(hs, "s hs traffic", th1).unwrap()
+    show("c_hs", c_hs.bytes)
+    show("s_hs", s_hs.bytes)
+    let ct = keys.traffic(s, c_hs).unwrap()
+    show("c_hs_key", ct.key.bytes)
+    show("c_hs_iv", ct.iv.bytes)
+    let st = keys.traffic(s, s_hs).unwrap()
+    show("s_hs_key", st.key.bytes)
+    show("s_hs_iv", st.iv.bytes)
+    let th2 = crypto.digest(h, "client hello|server hello|ee|cert|cv".bytes()).unwrap()
+    show("server_finished", keys.finished(s_hs, th2).unwrap())
+    let master = keys.master_secret(hs).unwrap()
+    show("master", master.bytes)
+    let th3 = crypto.digest(h, "client hello|server hello|ee|cert|cv|fin".bytes()).unwrap()
+    let c_ap = keys.derive_secret(master, "c ap traffic", th3).unwrap()
+    let s_ap = keys.derive_secret(master, "s ap traffic", th3).unwrap()
+    show("c_ap", c_ap.bytes)
+    show("s_ap", s_ap.bytes)
+    let ca = keys.traffic(s, c_ap).unwrap()
+    show("c_ap_key", ca.key.bytes)
+    show("c_ap_iv", ca.iv.bytes)
+    show("c_ap_next", keys.next_secret(c_ap).unwrap().bytes)
+    show("cv_content_sha256", crypto.sha256(keys.cert_verify_content(true, th2)))
+}
+
+fn main() uses io {
+    run("sha256", suite.Aes128GcmSha256)
+    run("sha384", suite.Aes256GcmSha384)
+    run("sha256-chacha", suite.ChaCha20Poly1305Sha256)
+}

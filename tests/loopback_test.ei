@@ -1,0 +1,475 @@
+// A TLS client and server of this package against each other in one process, over a socket
+// pair: every cipher suite and group, HelloRetryRequest, ALPN, client authentication,
+// certificate failures, key updates, 3 MB transfers, close_notify and truncation, a flipped
+// bit anywhere in the server's first 700 bytes, and a peer that never answers.
+
+import std.bytes
+import std.fs
+import std.io
+import std.net
+import std.stream
+import std.strings
+import std.task
+import std.time
+import tls.alert
+import tls.asn1
+import tls.client
+import tls.config
+import tls.conn
+import tls.handshake
+import tls.server
+import tls.suite
+import tls.x509
+
+fn rd(name: str) -> List[u8] uses fs {
+    let mut p = "tests/pki/".bytes()
+    bytes.append(inout p, name.bytes())
+    fs.read(p).unwrap()
+}
+
+fn identity(chain: str, key: str) -> config.Identity uses fs {
+    config.identity_from_pem(rd(chain), rd(key)).unwrap()
+}
+
+fn roots(name: str) -> x509.Store uses fs { x509.store_from_pem(rd(name)).unwrap() }
+
+fn now() -> i64 { asn1.days_from_civil(2026, 11, 6) * 86400 }
+
+fn client_cfg(name: str, root: str) -> config.ClientConfig uses fs {
+    let mut c = config.client_config(name, roots(root))
+    c.now = Some(now())
+    c
+}
+
+fn server_cfg(chain: str, key: str) -> config.ServerConfig uses fs {
+    let mut c = config.server_config(identity(chain, key))
+    c.now = Some(now())
+    c
+}
+
+fn payload(n: usize, salt: u8) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < n {
+        out.push((((i * 7 + (i / 251)) % 256) as u8) ^ salt)
+        i += 1
+    }
+    out
+}
+
+fn sum(b: List[u8]) -> u64 {
+    let mut s: u64 = 0
+    for x in b { s = (s * 31 + (x as u64)) % 1000000007 }
+    s
+}
+
+// The error as text. What a side sees when the other one fails depends on timing (an alert
+// that arrived in time, or a connection that was already closed), so those are one text.
+fn show_err(e: alert.Error) -> String {
+    let mut m = String.from("")
+    e.show(inout m)
+    if strings.contains(m, "the peer sent an alert") { return String.from("tls: the peer rejected the connection") }
+    if strings.contains(m, "Broken pipe") || strings.contains(m, "the connection is closed") || strings.contains(m, "reset by peer") {
+        return String.from("tls: the peer rejected the connection")
+    }
+    m
+}
+
+fn suite_name(s: suite.Suite) -> str { suite.name(s) }
+
+// What one side saw: how the handshake ended, then the data.
+fn opt_text(o: Option[List[u8]]) -> String {
+    match o {
+        Some(b) => {
+            let mut s = String.from("")
+            for c in b { s.push_byte(c) }
+            s
+        }
+        None => String.from("-")
+    }
+}
+
+// the server: read until the client's close_notify, answer with the length and a checksum
+fn serve[S: stream.Reader + stream.Writer + Copy](io: S, cfg: config.ServerConfig, rekey: u64, reply_n: usize) -> String uses io, clock {
+    match server.accept(io, cfg, time.after_ms(15000)) {
+        Err(e) => {
+            let m = show_err(e)
+            "handshake failed: {m}"
+        }
+        Ok(c0) => {
+            let mut c = c0.copy()
+            c.rekey_after = rekey
+            let mut got: List[u8] = List.new()
+            let mut outcome = String.from("")
+            while true {
+                match c.recv_by(65536, time.after_ms(15000)) {
+                    Ok(b) => {
+                        if b.len() == 0 { break }
+                        bytes.append(inout got, b)
+                    }
+                    Err(e) => {
+                        let m = show_err(e)
+                        outcome = "read failed: {m}"
+                        break
+                    }
+                }
+            }
+            if outcome.len() > 0 { return outcome }
+            let n = got.len()
+            let cs = sum(got)
+            let mut reply = "got {n} sum {cs}".bytes()
+            if reply_n > 0 { bytes.append(inout reply, payload(reply_n, 9)) }
+            match c.send_by(reply, time.after_ms(15000)) {
+                Ok(_) => {}
+                Err(e) => {
+                    let m = show_err(e)
+                    return "write failed: {m}"
+                }
+            }
+            let z = c.close()
+            let sn = opt_text(c.server_name)
+            let al = opt_text(c.negotiated_alpn())
+            let su = suite_name(c.cipher_suite())
+            let nc = c.peer_certificates().len()
+            let ru = c.key_updates_received
+            let rt = c.retried
+            "served {su} alpn={al} sni={sn} peer_certs={nc} key_updates_in={ru} retried={rt}"
+        }
+    }
+}
+
+fn run_client[S: stream.Reader + stream.Writer + Copy](io: S, cfg: config.ClientConfig, rekey: u64, send_n: usize, reply_n: usize, ask_update: bool) -> String uses io, clock {
+    match client.connect(io, cfg, time.after_ms(15000)) {
+        Err(e) => {
+            let m = show_err(e)
+            "handshake failed: {m}"
+        }
+        Ok(c0) => {
+            let mut c = c0.copy()
+            c.rekey_after = rekey
+            let data = payload(send_n, 3)
+            match c.send_by(data, time.after_ms(15000)) {
+                Ok(_) => {}
+                Err(e) => {
+                    let m = show_err(e)
+                    return "write failed: {m}"
+                }
+            }
+            if ask_update {
+                match c.update_keys(true, time.after_ms(15000)) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let m = show_err(e)
+                        return "key update failed: {m}"
+                    }
+                }
+            }
+            let z = c.close()
+            let mut got: List[u8] = List.new()
+            while true {
+                match c.recv_by(65536, time.after_ms(15000)) {
+                    Ok(b) => {
+                        if b.len() == 0 { break }
+                        bytes.append(inout got, b)
+                    }
+                    Err(e) => {
+                        let m = show_err(e)
+                        return "read failed: {m}"
+                    }
+                }
+            }
+            let mut want = "got {send_n} sum ".bytes()
+            let ws = sum(payload(send_n, 3))
+            bytes.append(inout want, "{ws}".bytes())
+            if reply_n > 0 { bytes.append(inout want, payload(reply_n, 9)) }
+            let su = suite_name(c.cipher_suite())
+            let al = opt_text(c.negotiated_alpn())
+            let ru = c.key_updates_received
+            let su2 = c.key_updates_sent
+            let rt = c.retried
+            let ok = bytes.eq(got, want)
+            "connected {su} alpn={al} reply_ok={ok} key_updates_in={ru} out={su2} retried={rt}"
+        }
+    }
+}
+
+fn scenario(name: str, ccfg: config.ClientConfig, scfg: config.ServerConfig) uses io, net, threads, clock {
+    scenario_with(name, ccfg, scfg, 5, 0, 18446744073709551615, false)
+}
+
+fn scenario_with(name: str, ccfg: config.ClientConfig, scfg: config.ServerConfig, send_n: usize, reply_n: usize, rekey: u64, ask: bool) uses io, net, threads, clock {
+    let pair = net.pair(net.STREAM).unwrap()
+    let a = stream.fd(pair.r)
+    let b = stream.fd(pair.w)
+    a.set_nonblocking(true).unwrap()
+    b.set_nonblocking(true).unwrap()
+    let th = spawn(|| -> String {
+        let r = serve(b, scfg, rekey, reply_n)
+        let z = b.close()
+        r
+    })
+    let cr = run_client(a, ccfg, rekey, send_n, reply_n, ask)
+    let z = a.close()
+    let sr = th.join()
+    print("{name}")
+    print("  client: {cr}")
+    print("  server: {sr}")
+}
+
+// ---- a stream that flips one bit of what it reads
+
+type Flip = { inner: stream.Fd, at: usize, seen: usize }
+
+impl stream.Reader for Flip {
+    fn read(inout self, max: usize) -> Result[List[u8], stream.Error] uses io {
+        let mut b = self.inner.read(max)?
+        self.flip(inout b)
+        Ok(b)
+    }
+
+    fn read_by(inout self, max: usize, dl: time.Deadline) -> Result[List[u8], stream.Error] uses io, clock {
+        let mut b = self.inner.read_by(max, dl)?
+        self.flip(inout b)
+        Ok(b)
+    }
+}
+
+impl Flip {
+    fn flip(inout self, inout b: List[u8]) {
+        let mut i: usize = 0
+        while i < b.len() {
+            if self.seen + i == self.at { b[i] = b[i] ^ 1 }
+            i += 1
+        }
+        self.seen += b.len()
+    }
+}
+
+impl stream.Writer for Flip {
+    fn write(inout self, data: List[u8]) -> Result[usize, stream.Error] uses io { self.inner.write(data) }
+    fn write_by(inout self, data: List[u8], dl: time.Deadline) -> Result[usize, stream.Error] uses io, clock { self.inner.write_by(data, dl) }
+    fn flush(inout self) -> Result[(), stream.Error] uses io { Ok(()) }
+    fn flush_by(inout self, dl: time.Deadline) -> Result[(), stream.Error] uses io, clock { Ok(()) }
+}
+
+// does a flipped bit at `at` in the server's flight make the handshake fail?
+fn tampered(at: usize, ccfg: config.ClientConfig, scfg: config.ServerConfig) -> String uses io, net, threads, clock {
+    let pair = net.pair(net.STREAM).unwrap()
+    let a = stream.fd(pair.r)
+    let b = stream.fd(pair.w)
+    a.set_nonblocking(true).unwrap()
+    b.set_nonblocking(true).unwrap()
+    let th = spawn(|| -> String {
+        let r = match server.accept(b, scfg, time.after_ms(3000)) {
+            Ok(c) => String.from("ok")
+            Err(e) => String.from("err")
+        }
+        let z = b.close()
+        r
+    })
+    let cr = match client.connect(Flip(a, at, 0), ccfg, time.after_ms(3000)) {
+        Ok(c) => String.from("ok")
+        Err(e) => String.from("err")
+    }
+    let z = a.close()
+    let sr = th.join()
+    "{cr}/{sr}"
+}
+
+// a server that sends the handshake then drops the connection without close_notify
+fn truncated(ccfg: config.ClientConfig, scfg: config.ServerConfig) uses io, net, threads, clock {
+    let pair = net.pair(net.STREAM).unwrap()
+    let a = stream.fd(pair.r)
+    let b = stream.fd(pair.w)
+    a.set_nonblocking(true).unwrap()
+    b.set_nonblocking(true).unwrap()
+    let th = spawn(|| -> String {
+        let r = match server.accept(b, scfg, time.after_ms(5000)) {
+            Ok(c0) => {
+                let mut c = c0.copy()
+                let w = c.send_by("partial".bytes(), time.after_ms(5000))
+                String.from("sent")
+            }
+            Err(e) => String.from("err")
+        }
+        // no close_notify: just close the socket
+        let z = b.close()
+        r
+    })
+    match client.connect(a, ccfg, time.after_ms(5000)) {
+        Ok(c0) => {
+            let mut c = c0.copy()
+            let first = c.recv_by(100, time.after_ms(5000))
+            print("  first read: {first}")
+            let second = c.recv_by(100, time.after_ms(5000))
+            match second {
+                Ok(x) => print("  second read: ok")
+                Err(e) => {
+                    let m = show_err(e)
+                    print("  second read: {m}")
+                }
+            }
+            // once failed, always failed
+            let third = c.send_by("x".bytes(), time.after_ms(1000))
+            match third {
+                Ok(x) => print("  write after failure: ok")
+                Err(e) => {
+                    let m = show_err(e)
+                    print("  write after failure: {m}")
+                }
+            }
+        }
+        Err(e) => {
+            let m = show_err(e)
+            print("  client: {m}")
+        }
+    }
+    let sr = th.join()
+    let z = a.close()
+}
+
+fn silent_peer(ccfg: config.ClientConfig, scfg: config.ServerConfig) uses io, net, clock {
+    let pair = net.pair(net.STREAM).unwrap()
+    let a = stream.fd(pair.r)
+    a.set_nonblocking(true).unwrap()
+    match client.connect(a, ccfg, time.after_ms(150)) {
+        Ok(c) => print("  client: connected?")
+        Err(e) => {
+            let m = show_err(e)
+            print("  client: {m}")
+        }
+    }
+    let b = stream.fd(pair.w)
+    b.set_nonblocking(true).unwrap()
+    match server.accept(b, scfg, time.after_ms(150)) {
+        Ok(c) => print("  server: connected?")
+        Err(e) => {
+            let m = show_err(e)
+            print("  server: {m}")
+        }
+    }
+    let z = a.close()
+    let y = b.close()
+}
+
+fn main() uses io, fs, net, threads, clock {
+    let good_c = client_cfg("localhost", "root.pem")
+    let ed_s = server_cfg("edchain.pem", "ed.key")
+    scenario("default: Ed25519 leaf via intermediate, X25519, AES-128-GCM", good_c, ed_s)
+
+    let mut c = client_cfg("localhost", "root.pem")
+    c.suites = List.new()
+    c.suites.push(suite.Aes256GcmSha384)
+    scenario("AES-256-GCM", c, ed_s)
+    c.suites = List.new()
+    c.suites.push(suite.ChaCha20Poly1305Sha256)
+    scenario("ChaCha20-Poly1305", c, ed_s)
+
+    c = client_cfg("localhost", "root.pem")
+    c.groups = List.new()
+    c.groups.push(handshake.GROUP_SECP256R1)
+    c.share_groups = c.groups.copy()
+    scenario("secp256r1 key exchange", c, ed_s)
+
+    scenario("ECDSA P-256 leaf", good_c, server_cfg("ec.pem", "ec.key"))
+
+    // HelloRetryRequest: the client sends an X25519 share, the server only takes P-256
+    let mut s = server_cfg("edchain.pem", "ed.key")
+    s.groups = List.new()
+    s.groups.push(handshake.GROUP_SECP256R1)
+    scenario("HelloRetryRequest", good_c, s)
+    s.groups = List.new()
+    s.groups.push(handshake.GROUP_X25519)
+    c = client_cfg("localhost", "root.pem")
+    c.share_groups = List.new()
+    c.share_groups.push(handshake.GROUP_SECP256R1)
+    scenario("HelloRetryRequest the other way", c, s)
+
+    // no group in common
+    s.groups = List.new()
+    s.groups.push(handshake.GROUP_X25519)
+    c = client_cfg("localhost", "root.pem")
+    c.groups = List.new()
+    c.groups.push(handshake.GROUP_SECP256R1)
+    c.share_groups = c.groups.copy()
+    scenario("no group in common", c, s)
+
+    // no suite in common
+    s = server_cfg("edchain.pem", "ed.key")
+    s.suites = List.new()
+    s.suites.push(suite.Aes256GcmSha384)
+    c = client_cfg("localhost", "root.pem")
+    c.suites = List.new()
+    c.suites.push(suite.ChaCha20Poly1305Sha256)
+    scenario("no cipher suite in common", c, s)
+
+    // ALPN
+    s = server_cfg("edchain.pem", "ed.key")
+    s.alpn.push("h2".bytes())
+    s.alpn.push("http/1.1".bytes())
+    c = client_cfg("localhost", "root.pem")
+    c.alpn.push("http/1.1".bytes())
+    c.alpn.push("h2".bytes())
+    scenario("ALPN: the server's preference wins", c, s)
+    c = client_cfg("localhost", "root.pem")
+    c.alpn.push("spdy/3".bytes())
+    scenario("ALPN: nothing in common", c, s)
+    scenario("ALPN: the client offers none", good_c, s)
+
+    // client authentication
+    s = server_cfg("edchain.pem", "ed.key")
+    s.client_auth = config.RequireClientAuth(roots("root.pem"))
+    c = client_cfg("localhost", "root.pem")
+    c.identity = Some(identity("client.pem", "client.key"))
+    scenario("client certificate (Ed25519), required", c, s)
+    scenario("client certificate required, none configured", good_c, s)
+    s.client_auth = config.RequestClientAuth(roots("root.pem"))
+    scenario("client certificate requested, none configured", good_c, s)
+    s.client_auth = config.RequireClientAuth(roots("other-root.pem"))
+    scenario("client certificate from an untrusted CA", c, s)
+
+    // server certificate failures
+    scenario("wrong host name", client_cfg("evil.example", "root.pem"), ed_s)
+    scenario("IP address in the certificate", client_cfg("127.0.0.1", "root.pem"), ed_s)
+    scenario("wildcard name", client_cfg("a.example.test", "root.pem"), ed_s)
+    scenario("untrusted root", client_cfg("localhost", "other-root.pem"), ed_s)
+    scenario("expired certificate", good_c, server_cfg("expired.pem", "expired.key"))
+    c = client_cfg("localhost", "root.pem")
+    c.now = Some(now() + 4000 * 86400)
+    scenario("the clock is after the validity", c, ed_s)
+    c = client_cfg("localhost", "other-root.pem")
+    c.verify = config.Insecure
+    scenario("verification switched off", c, ed_s)
+    scenario("missing intermediate", good_c, server_cfg("ed.pem", "ed.key"))
+    c = client_cfg("localhost", "root.pem")
+    c.server_name = None
+    scenario("no server_name with verification on", c, ed_s)
+
+    // key updates
+    scenario_with("key update before every record (both sides)", good_c, ed_s, 100000, 100000, 3, false)
+    scenario_with("the client asks for a key update", good_c, ed_s, 100, 100, 18446744073709551615, true)
+    // big transfers
+    scenario_with("3 MB each way", good_c, ed_s, 3000000, 3000000, 18446744073709551615, false)
+    scenario_with("empty request", good_c, ed_s, 0, 0, 18446744073709551615, false)
+
+    print("truncation")
+    truncated(good_c, ed_s)
+    print("silent peer")
+    silent_peer(good_c, ed_s)
+
+    // a flipped bit in the server's flight, ServerHello to Finished
+    let mut at: usize = 0
+    let mut survived: usize = 0
+    let mut total: usize = 0
+    let mut survivors = String.from("")
+    while at < 700 {
+        let r = tampered(at, good_c, ed_s)
+        total += 1
+        if r == String.from("ok/ok") {
+            survived += 1
+            survivors.append(" {at}")
+        }
+        at += 1
+    }
+    print("flipped bits: {total} tried, {survived} accepted at offsets:{survivors}")
+}

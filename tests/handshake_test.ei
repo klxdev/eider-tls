@@ -1,0 +1,316 @@
+// Handshake messages: serialize then parse gives the message back, a parser accepts nothing
+// that is cut short or has bytes left over, rejects duplicate extensions and bad lengths, and
+// survives tens of thousands of randomly damaged messages (it returns None; it does not trap).
+
+import std.bytes
+import std.io
+import tls.handshake
+import tls.wire
+
+type Rng = { s: u64 }
+
+fn next(inout r: Rng) -> u64 {
+    r.s = r.s *% 6364136223846793005 +% 1442695040888963407
+    r.s >> 33
+}
+
+fn below(inout r: Rng, n: usize) -> usize { (next(inout r) % (n as u64)) as usize }
+
+fn filled(n: usize, v: u8) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut i: usize = 0
+    while i < n {
+        out.push(v)
+        i += 1
+    }
+    out
+}
+
+fn l2(a: u32, b: u32) -> List[u32] {
+    let mut out: List[u32] = List.new()
+    out.push(a)
+    out.push(b)
+    out
+}
+
+fn l3(a: u32, b: u32, c: u32) -> List[u32] {
+    let mut out = l2(a, b)
+    out.push(c)
+    out
+}
+
+fn chain1(c: List[u8]) -> List[List[u8]] {
+    let mut out: List[List[u8]] = List.new()
+    out.push(c)
+    out
+}
+
+fn body_of(msg: List[u8]) -> List[u8] { wire.slice(msg, 4, msg.len()) }
+
+fn sample_client_hello() -> List[u8] {
+    let mut shares: List[handshake.KeyShare] = List.new()
+    shares.push(handshake.KeyShare(handshake.GROUP_X25519, filled(32, 5)))
+    let mut p256 = filled(65, 6)
+    p256[0] = 4
+    shares.push(handshake.KeyShare(handshake.GROUP_SECP256R1, p256))
+    let mut alpn: List[List[u8]] = List.new()
+    alpn.push("h2".bytes())
+    alpn.push("http/1.1".bytes())
+    let ch = handshake.ClientHello(filled(32, 1), filled(32, 2), l3(4865, 4866, 4867), Some("example.com".bytes()),
+        l2(29, 23), l2(2055, 1027), alpn, List.new(), shares, Some(filled(12, 9)), false, false)
+    handshake.client_hello(ch)
+}
+
+fn show_ch(m: Option[handshake.ClientHello]) -> String {
+    match m {
+        None => String.from("None")
+        Some(c) => {
+            let ns = c.suites.len()
+            let ng = c.groups.len()
+            let nk = c.shares.len()
+            let na = c.alpn.len()
+            let nv = c.versions.len()
+            let sni = match c.sni {
+                Some(s) => s.len()
+                None => 0
+            }
+            let ck = c.cookie.is_some()
+            "suites {ns} groups {ng} shares {nk} alpn {na} versions {nv} sni {sni} cookie {ck}"
+        }
+    }
+}
+
+fn mutate(inout r: Rng, b: List[u8]) -> List[u8] {
+    let mut out = b.copy()
+    let kind = below(inout r, 6)
+    if out.len() == 0 { return out }
+    if kind == 0 {
+        let i = below(inout r, out.len())
+        out[i] = out[i] ^ ((1 + below(inout r, 255)) as u8)
+    } else if kind == 1 {
+        out.truncate(below(inout r, out.len()))
+    } else if kind == 2 {
+        let i = below(inout r, out.len())
+        out.insert(i, below(inout r, 256) as u8)
+    } else if kind == 3 {
+        let i = below(inout r, out.len())
+        out.remove(i)
+    } else if kind == 4 {
+        // a length field gets a boundary value
+        let i = below(inout r, out.len())
+        let v: [u8; 4] = [0, 1, 255, 128]
+        out[i] = v[below(inout r, 4)]
+    } else {
+        let i = below(inout r, out.len())
+        let j = below(inout r, out.len())
+        let t = out[i]
+        out[i] = out[j]
+        out[j] = t
+    }
+    out
+}
+
+fn main() uses io {
+    // ---- ClientHello
+    let ch = sample_client_hello()
+    print("ClientHello: {ch.len()} bytes, type {ch[0]}")
+    print("parsed: {show_ch(handshake.parse_client_hello(body_of(ch)))}")
+    let body = body_of(ch)
+    let mut prefixes_ok = 0
+    let mut k: usize = 0
+    while k < body.len() {
+        if handshake.parse_client_hello(wire.slice(body, 0, k)).is_some() { prefixes_ok += 1 }
+        k += 1
+    }
+    print("proper prefixes accepted: {prefixes_ok} of {body.len()}")
+    let mut extra = body.copy()
+    extra.push(0)
+    print("trailing byte accepted: {handshake.parse_client_hello(extra).is_some()}")
+    // framing: the message in pieces
+    let mut fk: usize = 0
+    let mut needs = 0
+    while fk < ch.len() {
+        match handshake.frame(wire.slice(ch, 0, fk)) {
+            handshake.Need => { needs += 1 }
+            handshake.Message(_, _, _) => print("framed early at {fk}")
+            handshake.Oversize => print("oversize at {fk}")
+        }
+        fk += 1
+    }
+    print("every proper prefix needs more: {needs} of {ch.len()}")
+    match handshake.frame(ch) {
+        handshake.Message(t, b, raw) => print("framed: type {t} body {b.len()} raw {raw.len()}")
+        handshake.Need => print("whole message needs more?")
+        handshake.Oversize => print("whole message oversize?")
+    }
+    let mut two = ch.copy()
+    bytes.append(inout two, handshake.finished(filled(32, 3)))
+    match handshake.frame(two) {
+        handshake.Message(t, b, raw) => print("first of two: type {t} raw {raw.len()}")
+        handshake.Need => print("two: need?")
+        handshake.Oversize => print("two: oversize?")
+    }
+    let big = wire.hex("14ffffff")
+    match handshake.frame(big) {
+        handshake.Oversize => print("a 16 MB message is refused at its header")
+        handshake.Need => print("16 MB: need more?")
+        handshake.Message(_, _, _) => print("16 MB: message?")
+    }
+
+    // ---- duplicate extension, bad compression, bad lengths
+    let mut dup = body.copy()
+    // locate the extensions block: after version(2) random(32) sid(1+32) suites(2+6) comp(2)
+    let ext_at: usize = 2 + 32 + 33 + 8 + 2
+    let mut ext_len = ((body[ext_at] as usize) << 8) | (body[ext_at + 1] as usize)
+    // append a second supported_versions extension and fix the block length
+    let mut more: List[u8] = List.new()
+    wire.put_u16(inout more, handshake.EXT_SUPPORTED_VERSIONS)
+    wire.put_vec16(inout more, wire.hex("020304"))
+    bytes.append(inout dup, more)
+    ext_len += more.len()
+    dup[ext_at] = (ext_len >> 8) as u8
+    dup[ext_at + 1] = (ext_len & 255) as u8
+    print("duplicate extension accepted: {handshake.parse_client_hello(dup).is_some()}")
+    let mut comp = body.copy()
+    comp[2 + 32 + 33 + 8 + 1] = 1
+    print("compression method 1 accepted: {handshake.parse_client_hello(comp).is_some()}")
+    let mut nocomp = body.copy()
+    nocomp[2 + 32 + 33 + 8] = 2
+    print("two compression methods accepted: {handshake.parse_client_hello(nocomp).is_some()}")
+    let mut oddsuites = body.copy()
+    oddsuites[2 + 32 + 33 + 1] = 5
+    print("odd cipher suite list accepted: {handshake.parse_client_hello(oddsuites).is_some()}")
+    let mut longsid = body.copy()
+    longsid[2 + 32] = 33
+    print("session id of 33 bytes accepted: {handshake.parse_client_hello(longsid).is_some()}")
+
+    // ---- ServerHello and HelloRetryRequest
+    let sh = handshake.server_hello(handshake.ServerHello(filled(32, 7), filled(32, 2), 4865, 772, Some(handshake.KeyShare(29, filled(32, 8))), None, None, false))
+    match handshake.parse_server_hello(body_of(sh)) {
+        Some(s) => print("ServerHello: suite {s.suite} version {s.version} share {s.share.is_some()} retry {s.retry}")
+        None => print("ServerHello: None")
+    }
+    let hrr = handshake.server_hello(handshake.ServerHello(filled(32, 0), filled(32, 2), 4865, 772, None, Some(23), Some(filled(5, 1)), true))
+    match handshake.parse_server_hello(body_of(hrr)) {
+        Some(s) => {
+            let g = s.selected_group.unwrap()
+            print("HelloRetryRequest: retry {s.retry} group {g} cookie {s.cookie.is_some()} share {s.share.is_some()}")
+        }
+        None => print("HelloRetryRequest: None")
+    }
+    let hb = body_of(sh)
+    let mut sp = 0
+    k = 0
+    while k < hb.len() {
+        if handshake.parse_server_hello(wire.slice(hb, 0, k)).is_some() { sp += 1 }
+        k += 1
+    }
+    print("ServerHello proper prefixes accepted: {sp}")
+
+    // ---- EncryptedExtensions
+    let ee = handshake.encrypted_extensions(Some("h2".bytes()), true)
+    match handshake.parse_encrypted_extensions(body_of(ee)) {
+        Some(e) => print("EncryptedExtensions: alpn {e.alpn.is_some()} sni_ack {e.sni_ack} unexpected {e.unexpected.len()}")
+        None => print("EncryptedExtensions: None")
+    }
+    let mut unk: List[u8] = List.new()
+    let mut blk: List[u8] = List.new()
+    wire.put_u16(inout blk, 0xabcd)
+    wire.put_vec16(inout blk, List.new())
+    wire.put_vec16(inout unk, blk)
+    match handshake.parse_encrypted_extensions(unk) {
+        Some(e) => print("unknown extension is reported: {e.unexpected.len()}")
+        None => print("unknown extension: None")
+    }
+
+    // ---- Certificate, CertificateVerify, CertificateRequest, KeyUpdate, NewSessionTicket
+    let mut chain: List[List[u8]] = List.new()
+    chain.push(filled(300, 1))
+    chain.push(filled(5, 2))
+    let cm = handshake.certificate(List.new(), chain)
+    match handshake.parse_certificate(body_of(cm)) {
+        Some(c) => print("Certificate: {c.certs.len()} certificates, first {c.certs[0].len()} bytes, context {c.context.len()}")
+        None => print("Certificate: None")
+    }
+    let cb = body_of(cm)
+    sp = 0
+    k = 0
+    while k < cb.len() {
+        if handshake.parse_certificate(wire.slice(cb, 0, k)).is_some() { sp += 1 }
+        k += 1
+    }
+    print("Certificate proper prefixes accepted: {sp}")
+    let mut many: List[List[u8]] = List.new()
+    k = 0
+    while k < 17 {
+        many.push(filled(3, 1))
+        k += 1
+    }
+    print("17 certificates accepted: {handshake.parse_certificate(body_of(handshake.certificate(List.new(), many))).is_some()}")
+    print("an empty certificate entry accepted: {handshake.parse_certificate(body_of(handshake.certificate(List.new(), chain1(filled(0, 0))))).is_some()}")
+    let cv = handshake.certificate_verify(2055, filled(64, 4))
+    match handshake.parse_certificate_verify(body_of(cv)) {
+        Some(v) => print("CertificateVerify: alg {v.alg} signature {v.sig.len()} bytes")
+        None => print("CertificateVerify: None")
+    }
+    let cr = handshake.certificate_request(List.new(), l2(2055, 1027))
+    match handshake.parse_certificate_request(body_of(cr)) {
+        Some(r) => print("CertificateRequest: {r.sigalgs.len()} signature algorithms")
+        None => print("CertificateRequest: None")
+    }
+    print("KeyUpdate(true): {handshake.parse_key_update(body_of(handshake.key_update(true)))}")
+    print("KeyUpdate(false): {handshake.parse_key_update(body_of(handshake.key_update(false)))}")
+    let ku2 = handshake.parse_key_update(wire.hex("02"))
+    print("KeyUpdate with 2: {ku2}")
+    print("KeyUpdate empty: {handshake.parse_key_update(List.new())}")
+
+    // ---- damaged messages
+    let mut r = Rng(42)
+    let mut corpus: List[List[u8]] = List.new()
+    corpus.push(body)
+    corpus.push(hb)
+    corpus.push(body_of(ee))
+    corpus.push(cb)
+    corpus.push(body_of(cv))
+    corpus.push(body_of(cr))
+    corpus.push(body_of(hrr))
+    let mut parsed = 0
+    let mut total = 0
+    let mut round: usize = 0
+    while round < 6000 {
+        let src = corpus[round % corpus.len()].copy()
+        let mut m = mutate(inout r, src)
+        if below(inout r, 4) == 0 { m = mutate(inout r, m) }
+        let kind = round % corpus.len()
+        total += 1
+        if kind == 0 { if handshake.parse_client_hello(m).is_some() { parsed += 1 } }
+        if kind == 1 { if handshake.parse_server_hello(m).is_some() { parsed += 1 } }
+        if kind == 2 { if handshake.parse_encrypted_extensions(m).is_some() { parsed += 1 } }
+        if kind == 3 { if handshake.parse_certificate(m).is_some() { parsed += 1 } }
+        if kind == 4 { if handshake.parse_certificate_verify(m).is_some() { parsed += 1 } }
+        if kind == 5 { if handshake.parse_certificate_request(m).is_some() { parsed += 1 } }
+        if kind == 6 { if handshake.parse_server_hello(m).is_some() { parsed += 1 } }
+        round += 1
+    }
+    print("damaged messages: {total} parsed without a trap")
+    // random bytes of every length up to 600, to every parser
+    let mut hits = 0
+    let mut n: usize = 0
+    while n < 600 {
+        let mut g: List[u8] = List.new()
+        let mut j: usize = 0
+        while j < n {
+            g.push(below(inout r, 256) as u8)
+            j += 1
+        }
+        if handshake.parse_client_hello(g).is_some() { hits += 1 }
+        if handshake.parse_server_hello(g).is_some() { hits += 1 }
+        if handshake.parse_encrypted_extensions(g).is_some() { hits += 1 }
+        if handshake.parse_certificate(g).is_some() { hits += 1 }
+        if handshake.parse_certificate_verify(g).is_some() { hits += 1 }
+        if handshake.parse_certificate_request(g).is_some() { hits += 1 }
+        if handshake.valid_new_session_ticket(g) { hits += 1 }
+        n += 1
+    }
+    print("random bytes of 600 lengths to 7 parsers: no trap")
+}

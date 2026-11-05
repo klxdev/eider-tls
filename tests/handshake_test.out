@@ -1,0 +1,30 @@
+ClientHello: 277 bytes, type 1
+parsed: suites 3 groups 2 shares 2 alpn 2 versions 1 sni 11 cookie true
+proper prefixes accepted: 0 of 273
+trailing byte accepted: false
+every proper prefix needs more: 277 of 277
+framed: type 1 body 273 raw 277
+first of two: type 1 raw 277
+a 16 MB message is refused at its header
+duplicate extension accepted: false
+compression method 1 accepted: false
+two compression methods accepted: false
+odd cipher suite list accepted: false
+session id of 33 bytes accepted: false
+ServerHello: suite 4865 version 772 share true retry false
+HelloRetryRequest: retry true group 23 cookie true share false
+ServerHello proper prefixes accepted: 0
+EncryptedExtensions: alpn true sni_ack true unexpected 0
+unknown extension is reported: 1
+Certificate: 2 certificates, first 300 bytes, context 0
+Certificate proper prefixes accepted: 0
+17 certificates accepted: false
+an empty certificate entry accepted: false
+CertificateVerify: alg 2055 signature 64 bytes
+CertificateRequest: 2 signature algorithms
+KeyUpdate(true): Some(true)
+KeyUpdate(false): Some(false)
+KeyUpdate with 2: None
+KeyUpdate empty: None
+damaged messages: 6000 parsed without a trap
+random bytes of 600 lengths to 7 parsers: no trap

@@ -7,9 +7,10 @@
 # Every tests/*.ei and examples/*/tests/*.ei is run with the toolchain's compiler (`eider run`) and its
 # output compared with the .out next to it. The tests in TSAN (they use threads) are then
 # built once under ThreadSanitizer and run once each, when $CC can build a TSan program
-# (else `skip`). Prints `ok   <test>` or `FAIL <test>` with a diff, then `ALL OK`; exits 1
+# (else `skip`). Then tests/interop.sh runs the Eider client and server against the system's
+# `openssl s_server` and `s_client` (`skip` when there is no openssl). Prints `ok   <test>` or `FAIL <test>` with a diff, then `ALL OK`; exits 1
 # on a failure, 2 when there is no usable toolchain (scripts/env.sh).
-TSAN=""
+TSAN="tests/loopback_test.ei tests/hostile_peer_test.ei"
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 if [ -z "$NOBUILD" ]; then
   sh "$here/scripts/build.sh" || exit $?
@@ -22,6 +23,18 @@ for f in tests/*.ei examples/*/tests/*.ei; do
   got=$(ei run "$f" 2>&1 < /dev/null)
   if [ "$got" = "$(cat "${f%.ei}.out")" ]; then echo "ok   $f"; else echo "FAIL $f"; echo "$got" | diff "${f%.ei}.out" - | head -10; fail=1; fi
 done
+# interoperability with the system's openssl, both directions
+if command -v openssl >/dev/null 2>&1; then
+  B=$(mktemp -d)
+  if ei build tests/interop_client.ei -o "$B/iclient" > "$B/log" 2>&1 && ei build tests/interop_server.ei -o "$B/iserver" >> "$B/log" 2>&1; then
+    sh tests/interop.sh "$B" || fail=1
+  else
+    echo "FAIL interop: build"; cat "$B/log"; fail=1
+  fi
+  rm -rf "$B"
+else
+  echo "skip interop: no openssl on the PATH"
+fi
 if [ -n "$TSAN" ]; then
   T=$(mktemp -d)
   trap 'rm -rf "$T"' EXIT
