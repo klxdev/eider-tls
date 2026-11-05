@@ -25,8 +25,12 @@ extra certificate ignored: ok
 leaf as issuer: issuer is not a certificate authority
 no certificate: no certificate
 pinned leaf: ok
+signed with ecdsa-with-SHA384: unsupported certificate feature
+signed with RSA: unsupported certificate feature
+RSA root: parses, key OtherKey, ca true, can verify a signature: false
 tampered signature: certificate signature does not verify
 tampered tbs: certificate signature does not verify
+system store: parses without a skipped certificate: true
 match a.example.test: true
 match A.EXAMPLE.TEST: true
 match a.example.test.: true

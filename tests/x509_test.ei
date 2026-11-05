@@ -116,6 +116,12 @@ fn main() uses io, fs {
     show("no certificate", x509.verify_chain(List.new(), root, now, x509.ServerAuth, None))
     // the leaf is itself the trust anchor
     show("pinned leaf", x509.verify_chain(l1(leaf), store_of("ed.pem"), now, x509.ServerAuth, host("localhost")))
+    // signature algorithms and key types this package does not verify (RSA, ECDSA with SHA-384)
+    show("signed with ecdsa-with-SHA384", x509.verify_chain(certs("sha384sig.pem"), root, now, x509.ServerAuth, host("localhost")))
+    show("signed with RSA", x509.verify_chain(certs("rsasigned.pem"), store_of("rsaroot.pem"), now, x509.ServerAuth, host("localhost")))
+    let rsaroot = one("rsaroot.pem")
+    let rsa_signed = x509.signed_by(one("rsasigned.pem"), rsaroot)
+    print("RSA root: parses, key {rsaroot.key_kind}, ca {rsaroot.is_ca}, can verify a signature: {rsa_signed}")
     // a tampered signature
     let mut bad = leaf.copy()
     bad.sig[0] = bad.sig[0] ^ 1
@@ -124,6 +130,15 @@ fn main() uses io, fs {
     let mut bad2 = leaf.copy()
     bad2.tbs[bad2.tbs.len() - 1] = bad2.tbs[bad2.tbs.len() - 1] ^ 1
     show("tampered tbs", x509.verify_chain(l2(bad2, ed[1].copy()), root, now, x509.ServerAuth, host("localhost")))
+
+    // the operating system's bundle, when there is one: it all parses (most roots are RSA or P-384)
+    match x509.system_store() {
+        Ok(st) => {
+            let all = st.skipped == 0 && st.roots.len() > 50
+            print("system store: parses without a skipped certificate: {all}")
+        }
+        Err(e) => print("system store: absent")
+    }
 
     // host names (RFC 6125)
     let names2 = ["a.example.test", "A.EXAMPLE.TEST", "a.example.test.", "example.test", "a.b.example.test", ".example.test", "localhost", "LOCALHOST", "localhost.", "evil.com"]

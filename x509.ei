@@ -680,6 +680,9 @@ fn extend(chain: List[Cert], store: Store, cur: Cert, depth: usize, now: i64, us
     }
     if is_anchor(cur, store) { return Ok(cur) }
     if depth + 1 >= MAX_CHAIN { return Err(fail(TooDeep)) }
+    if sig_scheme(cur) == SigUnsupported {
+        return Err(Failure(Unsupported, String.from("unsupported certificate signature algorithm (only ed25519 and ecdsa-with-SHA256 are verified)")))
+    }
     // candidate issuers: the trust anchors first, then the intermediates the peer sent
     let mut best = fail(UnknownIssuer)
     let mut matched = false
