@@ -6,9 +6,16 @@
 //! share and the post-handshake behaviour: application data, close_notify, KeyUpdate and
 //! NewSessionTicket, and the alerts.
 //!
+//! Structure: the protocol is a "sans-I/O" core that only moves bytes between buffers
+//! (`inbuf` holds what the stream delivered, `outbuf` what is to be sent: `pop_record`,
+//! `queue`, `app_poll`), and thin wrappers that fill and flush the buffers with the stream:
+//! with a deadline (`..._by`, which need the capability `clock`) and without (`recv`,
+//! `send`, the `stream.Reader`/`Writer` methods, which need only `io`, as the traits say).
+//!
 //! Errors are `alert.Error`. When a connection fails for a protocol reason an alert is sent
-//! (best effort, within 200 ms) and every later call fails at once. A connection that ends
-//! without close_notify is `Truncated`, so a stream cut short cannot pass for a complete one.
+//! (best effort) and every later call fails at once. A connection that ends without
+//! close_notify is `Truncated`, so a stream cut short cannot pass for a complete one. A read
+//! that times out consumed nothing and the connection goes on.
 
 import std.stream
 import std.time
@@ -24,6 +31,7 @@ import tls.x509
 pub type Conn[S] = {
     io: S,
     inbuf: List[u8],
+    outbuf: List[u8],
     hsbuf: List[u8],
     app: List[u8],
     rd: record.Protector,
@@ -49,18 +57,7 @@ pub type Conn[S] = {
 }
 
 fn placeholder() -> record.Protector {
-    let secret = match crypto.prk(crypto.Sha256, wire.zeros(32)) {
-        Ok(p) => p
-        Err(_) => return placeholder_unreachable()
-    }
-    match record.protector(suite.Aes128GcmSha256, secret) {
-        Ok(p) => p
-        Err(_) => placeholder_unreachable()
-    }
-}
-
-// crypto.prk of 32 bytes and an AES-128 key cannot fail; this keeps `placeholder` total
-fn placeholder_unreachable() -> record.Protector {
+    // never used to protect anything: replaced when the handshake derives the keys
     let secret = crypto.Prk(crypto.Sha256, wire.zeros(32))
     let k = crypto.AeadKey(crypto.Aes128Gcm, wire.zeros(16))
     record.Protector(suite.Aes128GcmSha256, secret, k, crypto.Nonce(wire.zeros(12)), 0)
@@ -68,7 +65,7 @@ fn placeholder_unreachable() -> record.Protector {
 
 /// A connection that has not started a handshake.
 pub fn new_conn[S](io: S, is_client: bool) -> Conn[S] {
-    Conn(io, List.new(), List.new(), List.new(), placeholder(), placeholder(), false, false, false, is_client,
+    Conn(io, List.new(), List.new(), List.new(), List.new(), placeholder(), placeholder(), false, false, false, is_client,
          false, false, false, 0, record.REKEY_AFTER, suite.Aes128GcmSha256, None, None, List.new(), 0, 0, false)
 }
 
@@ -89,33 +86,19 @@ pub fn cert_failure(f: x509.Failure) -> alert.Error {
     alert.Error(alert.Certificate, a, f.detail, stream.Other)
 }
 
-// ------------------------------------------------------------------ reading records
+// ================================================================== the core (no I/O)
 
 /// What a record held: its (inner) content type and data.
 pub type RecIn = { ctype: u8, data: List[u8] }
 
-fn fill[S: stream.Reader + stream.Writer](inout c: Conn[S], want: usize, dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
-    while c.inbuf.len() < want {
-        let chunk = match c.io.read_by(16384, dl) {
-            Ok(b) => b
-            Err(e) => return Err(alert.io_error(e))
-        }
-        if chunk.len() == 0 {
-            return Err(alert.fail(alert.Truncated, alert.InternalError, "connection closed without close_notify"))
-        }
-        c.inbuf.extend(chunk)
-    }
-    Ok(())
-}
-
-/// The next record of a type the caller cares about: change_cipher_spec records are
-/// skipped (middlebox compatibility mode, RFC 8446 appendix D.4), records are decrypted when
-/// the read keys are on.
-pub fn read_record[S: stream.Reader + stream.Writer](inout c: Conn[S], dl: time.Deadline) -> Result[RecIn, alert.Error] uses io, clock {
+/// The next record in `inbuf`, removed from it and (when the read keys are on) decrypted;
+/// `None` when more bytes are needed. change_cipher_spec records are skipped (middlebox
+/// compatibility mode, RFC 8446 appendix D.4).
+fn pop_record[S](inout c: Conn[S]) -> Result[Option[RecIn], alert.Error] {
     while true {
         let limit = if c.rd_on { record.MAX_PROTECTED } else { record.MAX_PLAINTEXT }
         match record.parse(c.inbuf, 0, limit) {
-            record.NeedMore(n) => { fill(inout c, n, dl)? }
+            record.NeedMore(n) => { return Ok(None) }
             record.Bad(a, why) => return Err(alert.Error(alert.Protocol, a, why, stream.Other))
             record.Record(ct, hdr, body, used) => {
                 c.inbuf.remove_range(0, used)
@@ -134,18 +117,56 @@ pub fn read_record[S: stream.Reader + stream.Writer](inout c: Conn[S], dl: time.
                     if (o.ctype == record.HANDSHAKE || o.ctype == record.ALERT) && o.data.len() == 0 {
                         return Err(alert.protocol(alert.UnexpectedMessage, "empty handshake or alert record"))
                     }
-                    return Ok(RecIn(o.ctype, o.data))
+                    return Ok(Some(RecIn(o.ctype, o.data)))
                 } else {
                     if ct != record.HANDSHAKE && ct != record.ALERT {
                         return Err(alert.protocol(alert.UnexpectedMessage, "unexpected record type"))
                     }
                     if body.len() == 0 { return Err(alert.protocol(alert.UnexpectedMessage, "empty record")) }
-                    return Ok(RecIn(ct, body))
+                    return Ok(Some(RecIn(ct, body)))
                 }
             }
         }
     }
-    Err(alert.protocol(alert.InternalError, "unreachable"))
+    Ok(None)
+}
+
+/// Appends `data` as records of type `ctype` (protected when the write keys are on) to
+/// `outbuf`, in fragments of at most 2^14 bytes. The keys change before they have sealed
+/// `rekey_after` records of application data (a KeyUpdate goes out first).
+pub fn queue[S](inout c: Conn[S], ctype: u8, data: List[u8]) -> Result[(), alert.Error] {
+    let n = data.len()
+    if n == 0 { return Ok(()) }
+    let mut at: usize = 0
+    while at < n {
+        let stop = if n - at > record.MAX_PLAINTEXT { at + record.MAX_PLAINTEXT } else { n }
+        let chunk = wire.slice(data, at, stop)
+        if c.done && ctype == record.APPLICATION_DATA && c.wr.seq >= c.rekey_after {
+            queue_key_update(inout c, false)?
+        }
+        if c.wr_on {
+            c.outbuf.extend(record.seal(inout c.wr, ctype, chunk, 0)?)
+        } else {
+            c.outbuf.extend(record.plain(ctype, chunk))
+        }
+        at = stop
+    }
+    Ok(())
+}
+
+/// A KeyUpdate message under the current write keys, then new write keys (RFC 8446 4.6.3).
+fn queue_key_update[S](inout c: Conn[S], request: bool) -> Result[(), alert.Error] {
+    c.outbuf.extend(record.seal(inout c.wr, record.HANDSHAKE, handshake.key_update(request), 0)?)
+    record.rekey(inout c.wr)?
+    c.key_updates_sent += 1
+    Ok(())
+}
+
+fn queue_alert[S](inout c: Conn[S], level: u8, a: alert.Alert) -> Result[(), alert.Error] {
+    let mut b: List[u8] = List.new()
+    b.push(level)
+    b.push(alert.code(a))
+    queue(inout c, record.ALERT, b)
 }
 
 /// An alert record's body: Ok for close_notify (recorded in `peer_closed`), the peer's
@@ -160,155 +181,38 @@ fn on_alert[S](inout c: Conn[S], data: List[u8]) -> Result[(), alert.Error] {
     Err(alert.Error(alert.PeerAlert, a, String.from("the peer sent an alert"), stream.Other))
 }
 
-/// The next handshake message (type, body, raw bytes with the header) during the handshake.
-pub type HsMsg = { typ: u8, body: List[u8], raw: List[u8] }
-
-pub fn next_hs[S: stream.Reader + stream.Writer](inout c: Conn[S], dl: time.Deadline) -> Result[HsMsg, alert.Error] uses io, clock {
-    while true {
-        match handshake.frame(c.hsbuf) {
-            handshake.Message(t, body, raw) => {
-                c.hsbuf.remove_range(0, raw.len())
-                return Ok(HsMsg(t, body, raw))
-            }
-            handshake.Oversize => return Err(alert.protocol(alert.IllegalParameter, "handshake message too large"))
-            handshake.Need => {
-                let r = read_record(inout c, dl)?
-                if r.ctype == record.HANDSHAKE {
-                    c.hsbuf.extend(r.data)
-                } else if r.ctype == record.ALERT {
-                    on_alert(inout c, r.data)?
-                    return Err(alert.fail(alert.Truncated, alert.CloseNotify, "the peer closed the connection during the handshake"))
-                } else {
-                    return Err(alert.protocol(alert.UnexpectedMessage, "unexpected record during the handshake"))
-                }
-            }
-        }
-    }
-    Err(alert.protocol(alert.InternalError, "unreachable"))
-}
-
-// ------------------------------------------------------------------ writing records
-
-fn write_out[S: stream.Reader + stream.Writer](inout c: Conn[S], data: List[u8], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
-    match stream.write_all_by(inout c.io, data, dl) {
-        Ok(_) => Ok(())
-        Err(e) => {
-            // a partly written record leaves the stream in an unknown state
-            c.failed = true
-            Err(alert.io_error(e))
-        }
-    }
-}
-
-/// Sends `data` as records of type `ctype` (protected when the write keys are on), in
-/// fragments of at most 2^14 bytes.
-pub fn send[S: stream.Reader + stream.Writer](inout c: Conn[S], ctype: u8, data: List[u8], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
-    let mut out: List[u8] = List.new()
-    let mut at: usize = 0
-    let n = data.len()
-    if n == 0 && ctype == record.APPLICATION_DATA {
-        // nothing to say
-        return Ok(())
-    }
-    while at < n {
-        let stop = if n - at > record.MAX_PLAINTEXT { at + record.MAX_PLAINTEXT } else { n }
-        let chunk = wire.slice(data, at, stop)
-        // the keys change before they have sealed `rekey_after` records
-        if c.done && ctype == record.APPLICATION_DATA && c.wr.seq >= c.rekey_after {
-            if out.len() > 0 {
-                write_out(inout c, out, dl)?
-                out = List.new()
-            }
-            send_key_update(inout c, false, dl)?
-        }
-        if c.wr_on {
-            out.extend(record.seal(inout c.wr, ctype, chunk, 0)?)
-        } else {
-            out.extend(record.plain(ctype, chunk))
-        }
-        at = stop
-        if out.len() >= 262144 {
-            write_out(inout c, out, dl)?
-            out = List.new()
-        }
-    }
-    if out.len() > 0 { write_out(inout c, out, dl)? }
-    Ok(())
-}
-
-/// A compatibility change_cipher_spec record (unprotected, once per connection).
-pub fn send_ccs[S: stream.Reader + stream.Writer](inout c: Conn[S], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
-    let mut b: List[u8] = List.new()
-    b.push(1)
-    write_out(inout c, record.plain(record.CHANGE_CIPHER_SPEC, b), dl)
-}
-
-fn send_alert[S: stream.Reader + stream.Writer](inout c: Conn[S], level: u8, a: alert.Alert, dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
-    let mut b: List[u8] = List.new()
-    b.push(level)
-    b.push(alert.code(a))
-    send(inout c, record.ALERT, b, dl)
-}
-
-/// Fails the connection with `e`: sends the alert `e` names when it is one this side raised
-/// (best effort), marks the connection failed, and returns `e` for the caller to return.
-pub fn die[S: stream.Reader + stream.Writer](inout c: Conn[S], e: alert.Error) -> alert.Error uses io, clock {
-    if !c.failed {
-        c.failed = true
-        let ours = match e.kind {
-            alert.Protocol => true
-            alert.Certificate => true
-            _ => false
-        }
-        if ours && !c.sent_close {
-            c.sent_close = true
-            let r = send_alert(inout c, 2, e.alert, time.after_ms(200))
-        }
-    }
-    e
-}
-
-// ------------------------------------------------------------------ after the handshake
-
-fn closed_error() -> alert.Error { alert.fail(alert.Usage, alert.InternalError, "the connection is closed") }
-
 /// Handles one post-handshake handshake message: NewSessionTicket (dropped), KeyUpdate (the
-/// read keys change at once; a request is answered with our own update).
-fn post_handshake[S: stream.Reader + stream.Writer](inout c: Conn[S], m: HsMsg, dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
-    if m.typ == handshake.NEW_SESSION_TICKET {
+/// read keys change at once; a request is answered with our own update, queued).
+fn post_handshake[S](inout c: Conn[S], typ: u8, body: List[u8]) -> Result[(), alert.Error] {
+    if typ == handshake.NEW_SESSION_TICKET {
         if !c.is_client { return Err(alert.protocol(alert.UnexpectedMessage, "NewSessionTicket sent to a server")) }
-        if !handshake.valid_new_session_ticket(m.body) { return Err(alert.protocol(alert.DecodeError, "malformed NewSessionTicket")) }
+        if !handshake.valid_new_session_ticket(body) { return Err(alert.protocol(alert.DecodeError, "malformed NewSessionTicket")) }
         return Ok(())
     }
-    if m.typ == handshake.KEY_UPDATE {
-        let req = match handshake.parse_key_update(m.body) {
+    if typ == handshake.KEY_UPDATE {
+        let req = match handshake.parse_key_update(body) {
             Some(r) => r
             None => return Err(alert.protocol(alert.IllegalParameter, "malformed KeyUpdate"))
         }
         record.rekey(inout c.rd)?
         c.key_updates_received += 1
-        if req {
-            send_key_update(inout c, false, dl)?
-        }
+        if req { queue_key_update(inout c, false)? }
         return Ok(())
     }
     Err(alert.protocol(alert.UnexpectedMessage, "unexpected post-handshake message"))
 }
 
-/// Updates our sending keys (RFC 8446 section 4.6.3); with `request` the peer is asked to
-/// update its own.
-pub fn send_key_update[S: stream.Reader + stream.Writer](inout c: Conn[S], request: bool, dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
-    send(inout c, record.HANDSHAKE, handshake.key_update(request), dl)?
-    record.rekey(inout c.wr)?
-    c.key_updates_sent += 1
-    Ok(())
-}
-
-fn read_app[S: stream.Reader + stream.Writer](inout c: Conn[S], max: usize, dl: time.Deadline) -> Result[List[u8], alert.Error] uses io, clock {
+/// Application data for the reader: up to `max` bytes of what the peer sent, or an empty
+/// list after its close_notify; `None` when more input is needed first. Records are taken
+/// from `inbuf`; responses (KeyUpdate) are queued in `outbuf`.
+fn app_poll[S](inout c: Conn[S], max: usize) -> Result[Option[List[u8]], alert.Error] {
     let mut empties: u32 = 0
     while c.app.len() == 0 {
-        if c.peer_closed { return Ok(List.new()) }
-        let r = read_record(inout c, dl)?
+        if c.peer_closed { return Ok(Some(List.new())) }
+        let r = match pop_record(inout c)? {
+            Some(r) => r
+            None => return Ok(None)
+        }
         if r.ctype == record.APPLICATION_DATA {
             if r.data.len() == 0 {
                 empties += 1
@@ -324,7 +228,7 @@ fn read_app[S: stream.Reader + stream.Writer](inout c: Conn[S], max: usize, dl: 
                 match handshake.frame(c.hsbuf) {
                     handshake.Message(t, body, raw) => {
                         c.hsbuf.remove_range(0, raw.len())
-                        post_handshake(inout c, HsMsg(t, body, raw), dl)?
+                        post_handshake(inout c, t, body)?
                     }
                     handshake.Oversize => return Err(alert.protocol(alert.IllegalParameter, "handshake message too large"))
                     handshake.Need => break
@@ -337,15 +241,227 @@ fn read_app[S: stream.Reader + stream.Writer](inout c: Conn[S], max: usize, dl: 
     let n = if c.app.len() < max { c.app.len() } else { max }
     let out = wire.slice(c.app, 0, n)
     c.app.remove_range(0, n)
-    Ok(out)
+    Ok(Some(out))
 }
 
-fn after[T, S: stream.Reader + stream.Writer](inout c: Conn[S], r: Result[T, alert.Error]) -> Result[T, alert.Error] uses io, clock {
-    match r {
-        Ok(v) => Ok(v)
-        Err(e) => Err(die(inout c, e))
+/// The state change for a fatal error `e`: the connection is failed, and the alert `e` names
+/// is queued when this side raised it. Returns `e`.
+fn fail[S](inout c: Conn[S], e: alert.Error) -> alert.Error {
+    if !c.failed {
+        c.failed = true
+        let ours = match e.kind {
+            alert.Protocol => true
+            alert.Certificate => true
+            _ => false
+        }
+        if ours && !c.sent_close {
+            c.sent_close = true
+            let r = queue_alert(inout c, 2, e.alert)
+        }
+    }
+    e
+}
+
+fn closed_error() -> alert.Error { alert.fail(alert.Usage, alert.InternalError, "the connection is closed") }
+
+fn timed_out(e: alert.Error) -> bool { e.kind == alert.Io && e.io_kind == stream.TimedOut }
+
+// ================================================================== I/O with a deadline
+
+fn fill_by[S: stream.Reader + stream.Writer](inout c: Conn[S], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
+    let chunk = match c.io.read_by(16384, dl) {
+        Ok(b) => b
+        Err(e) => return Err(alert.io_error(e))
+    }
+    if chunk.len() == 0 {
+        return Err(alert.fail(alert.Truncated, alert.InternalError, "connection closed without close_notify"))
+    }
+    c.inbuf.extend(chunk)
+    Ok(())
+}
+
+fn flush_by[S: stream.Reader + stream.Writer](inout c: Conn[S], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
+    if c.outbuf.len() == 0 { return Ok(()) }
+    let out = c.outbuf.copy()
+    c.outbuf = List.new()
+    match stream.write_all_by(inout c.io, out, dl) {
+        Ok(_) => Ok(())
+        Err(e) => {
+            // a partly written record leaves the stream in an unknown state
+            c.failed = true
+            Err(alert.io_error(e))
+        }
     }
 }
+
+/// Sends `data` as records of type `ctype`, before `dl` (the handshakes use it).
+pub fn send[S: stream.Reader + stream.Writer](inout c: Conn[S], ctype: u8, data: List[u8], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
+    queue(inout c, ctype, data)?
+    flush_by(inout c, dl)
+}
+
+/// A compatibility change_cipher_spec record (unprotected, once per connection).
+pub fn send_ccs[S: stream.Reader + stream.Writer](inout c: Conn[S], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
+    let mut b: List[u8] = List.new()
+    b.push(1)
+    c.outbuf.extend(record.plain(record.CHANGE_CIPHER_SPEC, b))
+    flush_by(inout c, dl)
+}
+
+/// The next handshake message (type, body, raw bytes with the header) during the handshake.
+pub type HsMsg = { typ: u8, body: List[u8], raw: List[u8] }
+
+pub fn next_hs[S: stream.Reader + stream.Writer](inout c: Conn[S], dl: time.Deadline) -> Result[HsMsg, alert.Error] uses io, clock {
+    while true {
+        match handshake.frame(c.hsbuf) {
+            handshake.Message(t, body, raw) => {
+                c.hsbuf.remove_range(0, raw.len())
+                return Ok(HsMsg(t, body, raw))
+            }
+            handshake.Oversize => return Err(alert.protocol(alert.IllegalParameter, "handshake message too large"))
+            handshake.Need => {
+                match pop_record(inout c)? {
+                    None => { fill_by(inout c, dl)? }
+                    Some(r) => {
+                        if r.ctype == record.HANDSHAKE {
+                            c.hsbuf.extend(r.data)
+                        } else if r.ctype == record.ALERT {
+                            on_alert(inout c, r.data)?
+                            return Err(alert.fail(alert.Truncated, alert.CloseNotify, "the peer closed the connection during the handshake"))
+                        } else {
+                            return Err(alert.protocol(alert.UnexpectedMessage, "unexpected record during the handshake"))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(alert.protocol(alert.InternalError, "unreachable"))
+}
+
+/// Fails the connection with `e`: queues and sends (best effort, within 200 ms) the alert `e`
+/// names when it is one this side raised, marks the connection failed, and returns `e`.
+pub fn die[S: stream.Reader + stream.Writer](inout c: Conn[S], e: alert.Error) -> alert.Error uses io, clock {
+    let was = c.failed.copy()
+    fail(inout c, e)
+    if !was && c.outbuf.len() > 0 {
+        let r = flush_by(inout c, time.after_ms(200))
+    }
+    e
+}
+
+fn recv_loop_by[S: stream.Reader + stream.Writer](inout c: Conn[S], max: usize, dl: time.Deadline) -> Result[List[u8], alert.Error] uses io, clock {
+    while true {
+        match app_poll(inout c, max)? {
+            Some(b) => {
+                flush_by(inout c, dl)?
+                return Ok(b)
+            }
+            None => {
+                flush_by(inout c, dl)?
+                fill_by(inout c, dl)?
+            }
+        }
+    }
+    Err(alert.protocol(alert.InternalError, "unreachable"))
+}
+
+fn send_loop_by[S: stream.Reader + stream.Writer](inout c: Conn[S], data: List[u8], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
+    // large writes are sealed in slices so memory stays bounded
+    let mut at: usize = 0
+    let n = data.len()
+    while at < n {
+        let stop = if n - at > 1048576 { at + 1048576 } else { n }
+        queue(inout c, record.APPLICATION_DATA, wire.slice(data, at, stop))?
+        flush_by(inout c, dl)?
+        at = stop
+    }
+    Ok(())
+}
+
+// a failed call fails the connection, except a read that only timed out
+fn after_by[T, S: stream.Reader + stream.Writer](inout c: Conn[S], r: Result[T, alert.Error]) -> Result[T, alert.Error] uses io, clock {
+    match r {
+        Ok(v) => Ok(v)
+        Err(e) => {
+            if timed_out(e) && !c.failed { return Err(e) }
+            Err(die(inout c, e))
+        }
+    }
+}
+
+// ================================================================== I/O without a deadline
+
+fn fill[S: stream.Reader + stream.Writer](inout c: Conn[S]) -> Result[(), alert.Error] uses io {
+    let chunk = match c.io.read(16384) {
+        Ok(b) => b
+        Err(e) => return Err(alert.io_error(e))
+    }
+    if chunk.len() == 0 {
+        return Err(alert.fail(alert.Truncated, alert.InternalError, "connection closed without close_notify"))
+    }
+    c.inbuf.extend(chunk)
+    Ok(())
+}
+
+fn flush[S: stream.Reader + stream.Writer](inout c: Conn[S]) -> Result[(), alert.Error] uses io {
+    if c.outbuf.len() == 0 { return Ok(()) }
+    let out = c.outbuf.copy()
+    c.outbuf = List.new()
+    match stream.write_all(inout c.io, out) {
+        Ok(_) => Ok(())
+        Err(e) => {
+            c.failed = true
+            Err(alert.io_error(e))
+        }
+    }
+}
+
+fn die_blocking[S: stream.Reader + stream.Writer](inout c: Conn[S], e: alert.Error) -> alert.Error uses io {
+    let was = c.failed.copy()
+    fail(inout c, e)
+    if !was && c.outbuf.len() > 0 {
+        let r = flush(inout c)
+    }
+    e
+}
+
+fn recv_loop[S: stream.Reader + stream.Writer](inout c: Conn[S], max: usize) -> Result[List[u8], alert.Error] uses io {
+    while true {
+        match app_poll(inout c, max)? {
+            Some(b) => {
+                flush(inout c)?
+                return Ok(b)
+            }
+            None => {
+                flush(inout c)?
+                fill(inout c)?
+            }
+        }
+    }
+    Err(alert.protocol(alert.InternalError, "unreachable"))
+}
+
+fn send_loop[S: stream.Reader + stream.Writer](inout c: Conn[S], data: List[u8]) -> Result[(), alert.Error] uses io {
+    let mut at: usize = 0
+    let n = data.len()
+    while at < n {
+        let stop = if n - at > 1048576 { at + 1048576 } else { n }
+        queue(inout c, record.APPLICATION_DATA, wire.slice(data, at, stop))?
+        flush(inout c)?
+        at = stop
+    }
+    Ok(())
+}
+
+fn after[T, S: stream.Reader + stream.Writer](inout c: Conn[S], r: Result[T, alert.Error]) -> Result[T, alert.Error] uses io {
+    match r {
+        Ok(v) => Ok(v)
+        Err(e) => Err(die_blocking(inout c, e))
+    }
+}
+
+// ================================================================== the connection's methods
 
 fn to_stream(e: alert.Error) -> stream.Error {
     match e.kind {
@@ -360,29 +476,94 @@ fn to_stream(e: alert.Error) -> stream.Error {
     }
 }
 
+fn bad_max() -> alert.Error { alert.fail(alert.Usage, alert.InternalError, "read: max must be at least 1") }
+
 impl[S: stream.Reader + stream.Writer] Conn[S] {
     /// Application data from the peer: between 1 and `max` bytes, or an empty list once the
-    /// peer has sent close_notify (a clean end of stream).
-    fn recv_by(inout self, max: usize, dl: time.Deadline) -> Result[List[u8], alert.Error] uses io, clock {
+    /// peer has sent close_notify (a clean end of stream). Waits for the data; `recv_by` has a
+    /// deadline.
+    fn recv(inout self, max: usize) -> Result[List[u8], alert.Error] uses io {
         if self.failed { return Err(closed_error()) }
-        if max == 0 { return Err(alert.fail(alert.Usage, alert.InternalError, "read: max must be at least 1")) }
-        let r = read_app(inout self, max, dl)
+        if max == 0 { return Err(bad_max()) }
+        let r = recv_loop(inout self, max)
         after(inout self, r)
     }
 
-    /// Writes all of `data` as application data, updating the keys first if the limit on
-    /// records per key has been reached.
+    /// `recv`, or an error of kind `Io` with `io_kind` TimedOut once `dl` passes with nothing
+    /// read; the connection is then still usable and nothing was consumed.
+    fn recv_by(inout self, max: usize, dl: time.Deadline) -> Result[List[u8], alert.Error] uses io, clock {
+        if self.failed { return Err(closed_error()) }
+        if max == 0 { return Err(bad_max()) }
+        let r = recv_loop_by(inout self, max, dl)
+        after_by(inout self, r)
+    }
+
+    /// Writes all of `data` as application data, updating the keys when the limit on records
+    /// per key is reached. With a deadline: `send_by`; a timeout there leaves a partly written
+    /// record, so the connection is failed.
+    fn send(inout self, data: List[u8]) -> Result[(), alert.Error] uses io {
+        if self.failed || self.sent_close { return Err(closed_error()) }
+        let r = send_loop(inout self, data)
+        after(inout self, r)
+    }
+
     fn send_by(inout self, data: List[u8], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
         if self.failed || self.sent_close { return Err(closed_error()) }
-        let r = send_app(inout self, data, dl)
-        after(inout self, r)
+        let r = send_loop_by(inout self, data, dl)
+        match r {
+            Ok(v) => Ok(v)
+            Err(e) => {
+                // a write that timed out has put part of a record on the wire
+                self.failed = true
+                Err(die(inout self, e))
+            }
+        }
+    }
+
+    /// Application data already decrypted and waiting to be read.
+    fn buffered(self) -> usize { self.app.len() }
+
+    /// Whether `recv_by` would return without waiting for the network: plaintext is
+    /// buffered, the peer's close_notify has arrived, or a whole record is in the input
+    /// buffer. (A transport that waits on the socket's readiness asks this first: a record
+    /// that came in with the previous one makes the socket quiet while data is waiting.)
+    fn ready_to_read(self) -> bool {
+        if self.app.len() > 0 || self.peer_closed || self.failed { return true }
+        match record.parse(self.inbuf, 0, record.MAX_PROTECTED) {
+            record.Record(_, _, _, _) => true
+            record.Bad(_, _) => true
+            record.NeedMore(_) => false
+        }
+    }
+
+    /// Like `recv_by` but without waiting: `None` when no application data is ready yet
+    /// (the socket has nothing new, or only part of a record). Pair it with a wait for the
+    /// socket to be readable.
+    fn try_recv(inout self, max: usize) -> Result[Option[List[u8]], alert.Error] uses io, clock {
+        match self.recv_by(max, time.now()) {
+            Ok(b) => Ok(Some(b))
+            Err(e) => {
+                if timed_out(e) { return Ok(None) }
+                Err(e)
+            }
+        }
     }
 
     /// Updates the sending keys now; with `request` the peer is asked to update its own.
     fn update_keys(inout self, request: bool, dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
         if self.failed || self.sent_close { return Err(closed_error()) }
-        let r = send_key_update(inout self, request, dl)
-        after(inout self, r)
+        let q = queue_key_update(inout self, request)
+        let r = match q {
+            Ok(_) => flush_by(inout self, dl)
+            Err(e) => Err(e)
+        }
+        match r {
+            Ok(v) => Ok(v)
+            Err(e) => {
+                self.failed = true
+                Err(die(inout self, e))
+            }
+        }
     }
 
     /// Sends close_notify. The connection can still be read until the peer's close_notify
@@ -390,10 +571,16 @@ impl[S: stream.Reader + stream.Writer] Conn[S] {
     fn close_by(inout self, dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
         if self.failed || self.sent_close { return Ok(()) }
         self.sent_close = true
-        send_alert(inout self, 1, alert.CloseNotify, dl)
+        queue_alert(inout self, 1, alert.CloseNotify)?
+        flush_by(inout self, dl)
     }
 
-    fn close(inout self) -> Result[(), alert.Error] uses io, clock { self.close_by(time.after_ms(5000)) }
+    fn close(inout self) -> Result[(), alert.Error] uses io {
+        if self.failed || self.sent_close { return Ok(()) }
+        self.sent_close = true
+        queue_alert(inout self, 1, alert.CloseNotify)?
+        flush(inout self)
+    }
 
     /// The negotiated cipher suite.
     fn cipher_suite(self) -> suite.Suite { self.suite }
@@ -408,21 +595,9 @@ impl[S: stream.Reader + stream.Writer] Conn[S] {
     fn into_inner(self) -> S { self.io }
 }
 
-fn send_app[S: stream.Reader + stream.Writer](inout c: Conn[S], data: List[u8], dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
-    // large writes are sealed in slices so memory stays bounded
-    let mut at: usize = 0
-    let n = data.len()
-    while at < n {
-        let stop = if n - at > 1048576 { at + 1048576 } else { n }
-        send(inout c, record.APPLICATION_DATA, wire.slice(data, at, stop), dl)?
-        at = stop
-    }
-    Ok(())
-}
-
 impl[S: stream.Reader + stream.Writer] stream.Reader for Conn[S] {
     fn read(inout self, max: usize) -> Result[List[u8], stream.Error] uses io {
-        match self.recv_by(max, time.never()) {
+        match self.recv(max) {
             Ok(b) => Ok(b)
             Err(e) => Err(to_stream(e))
         }
@@ -438,7 +613,7 @@ impl[S: stream.Reader + stream.Writer] stream.Reader for Conn[S] {
 
 impl[S: stream.Reader + stream.Writer] stream.Writer for Conn[S] {
     fn write(inout self, data: List[u8]) -> Result[usize, stream.Error] uses io {
-        match self.send_by(data, time.never()) {
+        match self.send(data) {
             Ok(_) => Ok(data.len())
             Err(e) => Err(to_stream(e))
         }

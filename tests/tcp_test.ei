@@ -1,0 +1,85 @@
+// tls.dial and tls.accept_on over a real TCP connection on the loopback interface, and a
+// Conn used through the stream.Reader and stream.Writer traits (stream.read_all, write_all),
+// i.e. the way code written for a stream.Fd reads and writes it.
+
+import std.bytes
+import std.fs
+import std.io
+import std.net
+import std.stream
+import std.task
+import std.time
+import tls
+import tls.asn1
+import tls.config
+import tls.x509
+
+fn rd(name: str) -> List[u8] uses fs {
+    let mut p = "tests/pki/".bytes()
+    bytes.append(inout p, name.bytes())
+    fs.read(p).unwrap()
+}
+
+// a function written for any stream, as http's would be after the adapter
+fn shout[S: stream.Reader + stream.Writer](inout s: S) -> Result[String, stream.Error] uses io {
+    let mut got: List[u8] = List.new()
+    while got.len() < 11 {
+        let b = s.read(64)?
+        if b.len() == 0 { break }
+        bytes.append(inout got, b)
+    }
+    let mut out = "echo: ".bytes()
+    bytes.append(inout out, got)
+    s.write_all(out)?
+    Ok(String.from("shouted"))
+}
+
+fn main() uses io, fs, net, threads, clock {
+    let l = net.listener(net.ipv4(127, 0, 0, 1, 0), false).unwrap()
+    let addr = net.local_addr(l).unwrap()
+    var scfg = config.server_config(config.identity_from_pem(rd("edchain.pem"), rd("ed.key")).unwrap())
+    scfg.now = Some(asn1.days_from_civil(2026, 11, 6) * 86400)
+    var ccfg = config.client_config("localhost", x509.store_from_pem(rd("root.pem")).unwrap())
+    ccfg.now = scfg.now
+    let th = spawn(|| -> String {
+        match tls.accept_on(l, scfg, time.after_ms(10000)) {
+            Ok(c0) => {
+                let mut c = c0.copy()
+                let r = shout(inout c)
+                let z = c.close()
+                match r {
+                    Ok(s) => s
+                    Err(e) => "server: {e}"
+                }
+            }
+            Err(e) => {
+                let mut m = String.from("")
+                e.show(inout m)
+                m
+            }
+        }
+    })
+    match tls.dial(addr, ccfg, time.after_ms(10000)) {
+        Ok(c0) => {
+            let mut c = c0.copy()
+            let w = stream.write_all(inout c, "hello world".bytes())
+            // read_all reads to the server's close_notify
+            match stream.read_all(inout c) {
+                Ok(b) => io.outln(b)
+                Err(e) => print("client read: {e}")
+            }
+        }
+        Err(e) => {
+            let mut m = String.from("")
+            e.show(inout m)
+            print("dial: {m}")
+        }
+    }
+    print(th.join())
+    // a dial to a port nobody listens on, and one that is refused by a wrong name
+    let z = stream.fd(l).close()
+    match tls.dial(addr, ccfg, time.after_ms(2000)) {
+        Ok(c) => print("dial to a closed port: connected?")
+        Err(e) => print("dial to a closed port: failed")
+    }
+}

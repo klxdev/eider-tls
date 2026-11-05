@@ -38,13 +38,13 @@ client certificate (Ed25519), required
   client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
   server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=1 key_updates_in=0 retried=false
 client certificate required, none configured
-  client: read failed: tls: the peer rejected the connection
+  client: transfer failed: tls: the peer rejected the connection
   server: handshake failed: tls: the client sent no certificate (sent alert certificate_required)
 client certificate requested, none configured
   client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
   server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
 client certificate from an untrusted CA
-  client: read failed: tls: the peer rejected the connection
+  client: transfer failed: tls: the peer rejected the connection
   server: handshake failed: tls: unable to find a trusted issuer (sent alert unknown_ca)
 wrong host name
   client: handshake failed: tls: certificate is not valid for the host name (sent alert bad_certificate)
@@ -88,7 +88,13 @@ empty request
 truncation
   first read: Ok([112, 97, 114, 116, 105, 97, 108])
   second read: tls: connection closed without close_notify
-  write after failure: tls: the peer rejected the connection
+  write after failure: tls: the connection is closed
+timeouts
+  read with nothing sent: tls: read: timed out
+  try_recv with nothing sent: Ok(None)
+  ready to read: false
+pong
+  connection still usable after the timeout
 silent peer
   client: tls: read: timed out
   server: tls: read: timed out

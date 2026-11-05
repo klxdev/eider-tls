@@ -10,7 +10,11 @@
 # (else `skip`). Then tests/interop.sh runs the Eider client and server against the system's
 # `openssl s_server` and `s_client` (`skip` when there is no openssl). Prints `ok   <test>` or `FAIL <test>` with a diff, then `ALL OK`; exits 1
 # on a failure, 2 when there is no usable toolchain (scripts/env.sh).
-TSAN="tests/loopback_test.ei tests/hostile_peer_test.ei"
+#
+#   ASAN=1 sh scripts/test.sh      also run every test under AddressSanitizer and UBSan, with
+#                                  the crypto backend built the same way (minutes; the timing
+#                                  test is left out: a sanitizer makes timings meaningless)
+TSAN="tests/loopback_test.ei tests/hostile_peer_test.ei tests/tcp_test.ei"
 here=$(cd "$(dirname "$0")/.." && pwd -P)
 if [ -z "$NOBUILD" ]; then
   sh "$here/scripts/build.sh" || exit $?
@@ -50,6 +54,19 @@ if [ -n "$TSAN" ]; then
   else
     echo "skip tsan runs ($TSAN): ${CC:-cc} cannot build a -fsanitize=thread program"
   fi
+fi
+if [ -n "$ASAN" ]; then
+  A=$(mktemp -d)
+  trap 'rm -rf "$A"' EXIT
+  for f in tests/*_test.ei; do
+    [ "$f" = tests/ct_test.ei ] && continue
+    [ -f "${f%.ei}.out" ] || continue
+    if ! (EIDER_CACHE=off EIDER_CRYPTO_SAN=1 EIDER_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"; export EIDER_CACHE EIDER_CRYPTO_SAN EIDER_CFLAGS; ei build "$f" -o "$A/t") > "$A/log" 2>&1; then
+      echo "FAIL $f (asan): build"; cat "$A/log"; fail=1; continue
+    fi
+    got=$(ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 "$A/t" < /dev/null 2>&1)
+    if [ "$got" = "$(cat "${f%.ei}.out")" ]; then echo "ok   $f (asan+ubsan)"; else echo "FAIL $f (asan+ubsan)"; echo "$got" | diff "${f%.ei}.out" - | head -20; fail=1; fi
+  done
 fi
 [ $fail = 0 ] && echo "ALL OK"
 exit $fail

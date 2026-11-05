@@ -109,7 +109,7 @@ fn serve[S: stream.Reader + stream.Writer + Copy](io: S, cfg: config.ServerConfi
                     }
                     Err(e) => {
                         let m = show_err(e)
-                        outcome = "read failed: {m}"
+                        outcome = "transfer failed: {m}"
                         break
                     }
                 }
@@ -123,7 +123,7 @@ fn serve[S: stream.Reader + stream.Writer + Copy](io: S, cfg: config.ServerConfi
                 Ok(_) => {}
                 Err(e) => {
                     let m = show_err(e)
-                    return "write failed: {m}"
+                    return "transfer failed: {m}"
                 }
             }
             let z = c.close()
@@ -152,7 +152,7 @@ fn run_client[S: stream.Reader + stream.Writer + Copy](io: S, cfg: config.Client
                 Ok(_) => {}
                 Err(e) => {
                     let m = show_err(e)
-                    return "write failed: {m}"
+                    return "transfer failed: {m}"
                 }
             }
             if ask_update {
@@ -174,7 +174,7 @@ fn run_client[S: stream.Reader + stream.Writer + Copy](io: S, cfg: config.Client
                     }
                     Err(e) => {
                         let m = show_err(e)
-                        return "read failed: {m}"
+                        return "transfer failed: {m}"
                     }
                 }
             }
@@ -314,7 +314,8 @@ fn truncated(ccfg: config.ClientConfig, scfg: config.ServerConfig) uses io, net,
             match third {
                 Ok(x) => print("  write after failure: ok")
                 Err(e) => {
-                    let m = show_err(e)
+                    let mut m = String.from("")
+                    e.show(inout m)
                     print("  write after failure: {m}")
                 }
             }
@@ -326,6 +327,64 @@ fn truncated(ccfg: config.ClientConfig, scfg: config.ServerConfig) uses io, net,
     }
     let sr = th.join()
     let z = a.close()
+}
+
+// a read that times out consumes nothing and does not end the connection
+fn timeouts(ccfg: config.ClientConfig, scfg: config.ServerConfig) uses io, net, threads, clock {
+    let pair = net.pair(net.STREAM).unwrap()
+    let a = stream.fd(pair.r)
+    let b = stream.fd(pair.w)
+    a.set_nonblocking(true).unwrap()
+    b.set_nonblocking(true).unwrap()
+    let th = spawn(|| -> String {
+        let r = match server.accept(b, scfg, time.after_ms(5000)) {
+            Ok(c0) => {
+                let mut c = c0.copy()
+                let got = c.recv_by(10, time.after_ms(5000))
+                time.sleep_ms(50)
+                // two records: the client's reads take them one after the other
+                let w1 = c.send_by("po".bytes(), time.after_ms(5000))
+                let w2 = c.send_by("ng".bytes(), time.after_ms(5000))
+                String.from("served")
+            }
+            Err(e) => String.from("err")
+        }
+        r
+    })
+    match client.connect(a, ccfg, time.after_ms(5000)) {
+        Ok(c0) => {
+            let mut c = c0.copy()
+            let first = c.recv_by(10, time.after_ms(30))
+            match first {
+                Ok(x) => print("  read with nothing sent: ok?")
+                Err(e) => {
+                    let m = show_err(e)
+                    print("  read with nothing sent: {m}")
+                }
+            }
+            let none = c.try_recv(10)
+            print("  try_recv with nothing sent: {none}")
+            let rr = c.ready_to_read()
+            print("  ready to read: {rr}")
+            let w = c.send_by("ping".bytes(), time.after_ms(5000))
+            var got: List[u8] = List.new()
+            while got.len() < 4 {
+                match c.recv_by(10, time.after_ms(5000)) {
+                    Ok(x) => { bytes.append(inout got, x) }
+                    Err(e) => { got = "failed".bytes() }
+                }
+            }
+            io.outln(got)
+            print("  connection still usable after the timeout")
+        }
+        Err(e) => {
+            let m = show_err(e)
+            print("  client: {m}")
+        }
+    }
+    let sr = th.join()
+    let z = a.close()
+    let y = b.close()
 }
 
 fn silent_peer(ccfg: config.ClientConfig, scfg: config.ServerConfig) uses io, net, clock {
@@ -454,6 +513,8 @@ fn main() uses io, fs, net, threads, clock {
 
     print("truncation")
     truncated(good_c, ed_s)
+    print("timeouts")
+    timeouts(good_c, ed_s)
     print("silent peer")
     silent_peer(good_c, ed_s)
 
