@@ -1,0 +1,57 @@
+chain of 2 certificates
+leaf: version 2, key Ed25519Key, ca false, dns 2, ips 2
+inter: ca true, path_len Some(0)
+root: ca true, path_len Some(1)
+validity: true
+ed chain via intermediate: ok
+ed chain, ip 127.0.0.1: ok
+ed chain, ip ::1: ok
+ed chain, wildcard: ok
+ed chain, wrong name: certificate is not valid for the host name
+ed chain, no name check: ok
+ed chain, ip 10.0.0.1: certificate is not valid for the host name
+ed leaf alone: unable to find a trusted issuer
+ed chain with the root appended: ok
+ec leaf: ok
+untrusted root: unable to find a trusted issuer
+empty store: unable to find a trusted issuer
+expired leaf: certificate has expired
+not yet valid: certificate is not yet valid
+after the end: certificate has expired
+client cert as server: certificate not valid for this use
+client cert as client: ok
+server cert as client: ok
+extra certificate ignored: ok
+leaf as issuer: issuer is not a certificate authority
+no certificate: no certificate
+pinned leaf: ok
+tampered signature: certificate signature does not verify
+tampered tbs: certificate signature does not verify
+match a.example.test: true
+match A.EXAMPLE.TEST: true
+match a.example.test.: true
+match example.test: false
+match a.b.example.test: false
+match .example.test: false
+match localhost: true
+match LOCALHOST: true
+match localhost.: true
+match evil.com: false
+ip 1.2.3.4: 4 bytes, last 4
+ip 1.2.3: no
+ip 1.2.3.4.5: no
+ip 256.1.1.1: no
+ip 01.2.3.4: no
+ip ::1: 16 bytes, last 1
+ip ::: 16 bytes, last 0
+ip 1::2: 16 bytes, last 2
+ip 1:2:3:4:5:6:7:8: 16 bytes, last 8
+ip 1:2:3:4:5:6:7: no
+ip 1::2::3: no
+ip :1: no
+ip 1:: no
+ip ::ffff: 16 bytes, last 255
+ip fe80::1:2: 16 bytes, last 2
+ip 12345::: no
+ip localhost: no
+days 0 11017 24855

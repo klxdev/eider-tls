@@ -1,0 +1,113 @@
+//! tls.keyfile: private keys for a server: PKCS#8 (`PRIVATE KEY`, RFC 5958) holding an
+//! Ed25519 key (RFC 8410) or a P-256 key, and SEC1 (`EC PRIVATE KEY`, RFC 5915). Encrypted
+//! keys and other algorithms are refused.
+
+import std.bytes
+import crypto
+import tls.asn1
+import tls.pem
+import tls.wire
+
+/// A signing key and, for the certificate check, its public half.
+pub type SigningKey =
+    | EdKey(seed: crypto.Ed25519Seed)
+    | EcKey(secret: crypto.P256Secret)
+
+fn oid_ed25519() -> List[u8] { wire.hex("2b6570") }
+fn oid_ec_public_key() -> List[u8] { wire.hex("2a8648ce3d0201") }
+fn oid_prime256v1() -> List[u8] { wire.hex("2a8648ce3d030107") }
+
+// ECPrivateKey ::= SEQUENCE { version INTEGER 1, privateKey OCTET STRING, [0] parameters,
+// [1] publicKey }
+fn sec1(d: asn1.Dr, seq: asn1.Tlv) -> Option[SigningKey] {
+    let mut s = asn1.into(d, seq)
+    let v = asn1.expect(inout s, asn1.INTEGER)?
+    if asn1.small_uint(d, v)? != 1 { return None }
+    let k = asn1.expect(inout s, asn1.OCTET_STRING)?
+    let sec = asn1.content(d, k)
+    if sec.len() != 32 { return None }
+    match asn1.expect(inout s, asn1.explicit(0)) {
+        Some(p) => {
+            let mut pr = asn1.into(d, p)
+            let o = asn1.expect(inout pr, asn1.OID)?
+            if !asn1.is_oid(d, o, oid_prime256v1()) { return None }
+        }
+        None => {}
+    }
+    match crypto.p256_secret(sec) {
+        Ok(x) => Some(EcKey(x))
+        Err(_) => None
+    }
+}
+
+fn pkcs8(d: asn1.Dr, seq: asn1.Tlv) -> Option[SigningKey] {
+    let mut s = asn1.into(d, seq)
+    let v = asn1.expect(inout s, asn1.INTEGER)?
+    // version 0 (v1) or 1 (v2 with a public key attribute)
+    let ver = asn1.small_uint(d, v)?
+    if ver > 1 { return None }
+    let alg = asn1.expect(inout s, asn1.SEQUENCE)?
+    let key = asn1.expect(inout s, asn1.OCTET_STRING)?
+    let mut ar = asn1.into(d, alg)
+    let oid = asn1.expect(inout ar, asn1.OID)?
+    let mut kr = asn1.into(d, key)
+    if asn1.is_oid(d, oid, oid_ed25519()) {
+        if !asn1.done(ar) { return None }
+        // CurvePrivateKey ::= OCTET STRING (32)
+        let inner = asn1.expect(inout kr, asn1.OCTET_STRING)?
+        if !asn1.done(kr) { return None }
+        match crypto.ed25519_seed(asn1.content(d, inner)) {
+            Ok(x) => return Some(EdKey(x))
+            Err(_) => return None
+        }
+    }
+    if asn1.is_oid(d, oid, oid_ec_public_key()) {
+        let curve = asn1.expect(inout ar, asn1.OID)?
+        if !asn1.is_oid(d, curve, oid_prime256v1()) { return None }
+        let ec = asn1.expect(inout kr, asn1.SEQUENCE)?
+        if !asn1.done(kr) { return None }
+        return sec1(d, ec)
+    }
+    None
+}
+
+/// The key in a DER PKCS#8 `PrivateKeyInfo`.
+pub fn from_pkcs8(der: List[u8]) -> Result[SigningKey, String] {
+    let mut d = asn1.reader(der)
+    let bad = String.from("keyfile: unsupported or malformed PKCS#8 private key")
+    let seq = match asn1.expect(inout d, asn1.SEQUENCE) {
+        Some(s) => s
+        None => return Err(bad)
+    }
+    if !asn1.done(d) { return Err(bad) }
+    match pkcs8(d, seq) {
+        Some(k) => Ok(k)
+        None => Err(bad)
+    }
+}
+
+/// The key in a DER SEC1 `ECPrivateKey`.
+pub fn from_sec1(der: List[u8]) -> Result[SigningKey, String] {
+    let mut d = asn1.reader(der)
+    let bad = String.from("keyfile: unsupported or malformed EC private key")
+    let seq = match asn1.expect(inout d, asn1.SEQUENCE) {
+        Some(s) => s
+        None => return Err(bad)
+    }
+    if !asn1.done(d) { return Err(bad) }
+    match sec1(d, seq) {
+        Some(k) => Ok(k)
+        None => Err(bad)
+    }
+}
+
+/// The first private key in PEM text: `PRIVATE KEY` or `EC PRIVATE KEY`.
+pub fn from_pem(text: List[u8]) -> Result[SigningKey, String] {
+    let blocks = pem.decode_all(text)?
+    for b in blocks {
+        if bytes.eq(b.label, "PRIVATE KEY".bytes()) { return from_pkcs8(b.der) }
+        if bytes.eq(b.label, "EC PRIVATE KEY".bytes()) { return from_sec1(b.der) }
+        if bytes.eq(b.label, "ENCRYPTED PRIVATE KEY".bytes()) { return Err(String.from("keyfile: encrypted private keys are not supported")) }
+    }
+    Err(String.from("keyfile: no private key in the PEM text"))
+}

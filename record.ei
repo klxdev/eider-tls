@@ -1,0 +1,133 @@
+//! tls.record: the TLS 1.3 record layer (RFC 8446 section 5): framing, AEAD protection with
+//! the per-record nonce, padding, and the size limits (a plaintext fragment is at most 2^14
+//! bytes, a protected record at most 2^14 + 256).
+
+import crypto
+import tls.alert
+import tls.keys
+import tls.suite
+import tls.wire
+
+pub const CHANGE_CIPHER_SPEC: u8 = 20
+pub const ALERT: u8 = 21
+pub const HANDSHAKE: u8 = 22
+pub const APPLICATION_DATA: u8 = 23
+
+pub const MAX_PLAINTEXT: usize = 16384
+pub const MAX_PROTECTED: usize = 16640
+
+/// Records sent under one key before the sender asks for a key update (RFC 8446 section 5.5
+/// bounds AES-GCM at 2^24.5 full-size records per key; this stays below it).
+pub const REKEY_AFTER: u64 = 16777216
+
+/// The keys of one direction.
+pub type Protector = { suite: suite.Suite, secret: crypto.Prk, key: crypto.AeadKey, iv: crypto.Nonce, seq: u64 }
+
+fn failed(e: crypto.Error) -> alert.Error { alert.protocol(alert.InternalError, "crypto provider failure") }
+
+pub fn protector(s: suite.Suite, secret: crypto.Prk) -> Result[Protector, alert.Error] {
+    match keys.traffic(s, secret) {
+        Ok(t) => Ok(Protector(s, secret, t.key, t.iv, 0))
+        Err(e) => Err(failed(e))
+    }
+}
+
+/// The traffic keys after a KeyUpdate: the next secret, sequence number zero.
+pub fn rekey(inout p: Protector) -> Result[(), alert.Error] {
+    let next = match keys.next_secret(p.secret) {
+        Ok(n) => n
+        Err(e) => return Err(failed(e))
+    }
+    let np = protector(p.suite, next)?
+    p = np
+    Ok(())
+}
+
+/// A record header: type, legacy version 0x0303, length.
+pub fn header(ctype: u8, len: usize) -> List[u8] {
+    let mut h: List[u8] = List.new()
+    h.push(ctype)
+    h.push(3)
+    h.push(3)
+    wire.put_u16(inout h, (len & 65535) as u32)
+    h
+}
+
+/// An unprotected record carrying `body` (at most MAX_PLAINTEXT bytes).
+pub fn plain(ctype: u8, body: List[u8]) -> List[u8] {
+    let mut out = header(ctype, body.len())
+    wire.put(inout out, body)
+    out
+}
+
+/// Protects `content` (at most MAX_PLAINTEXT bytes) as one record of type `ctype`, with
+/// `pad` zero bytes of padding, and advances the sequence number.
+pub fn seal(inout p: Protector, ctype: u8, content: List[u8], pad: usize) -> Result[List[u8], alert.Error] {
+    if content.len() > MAX_PLAINTEXT { return Err(alert.protocol(alert.InternalError, "record fragment too large")) }
+    if p.seq == 18446744073709551615 { return Err(alert.protocol(alert.InternalError, "record sequence number exhausted")) }
+    let mut inner = content.copy()
+    inner.push(ctype)
+    let mut k: usize = 0
+    while k < pad {
+        inner.push(0)
+        k += 1
+    }
+    let hdr = header(APPLICATION_DATA, inner.len() + crypto.TAG_LEN)
+    let n = crypto.nonce_for_sequence(p.iv, p.seq)
+    let ct = match crypto.seal(p.key, n, hdr, inner) {
+        Ok(c) => c
+        Err(e) => return Err(failed(e))
+    }
+    p.seq += 1
+    Ok(wire.concat(hdr, ct))
+}
+
+/// What a protected record held.
+pub type Opened = { ctype: u8, data: List[u8] }
+
+/// Decrypts the body of a protected record whose header was `hdr` (5 bytes). Any failure is
+/// bad_record_mac (RFC 8446 section 5.2), so a peer learns nothing about why; an inner
+/// plaintext that is all zero is unexpected_message.
+pub fn open(inout p: Protector, hdr: List[u8], body: List[u8]) -> Result[Opened, alert.Error] {
+    if body.len() > MAX_PROTECTED { return Err(alert.protocol(alert.RecordOverflow, "record too long")) }
+    if body.len() < crypto.TAG_LEN + 1 { return Err(alert.protocol(alert.DecodeError, "protected record too short")) }
+    if p.seq == 18446744073709551615 { return Err(alert.protocol(alert.InternalError, "record sequence number exhausted")) }
+    let n = crypto.nonce_for_sequence(p.iv, p.seq)
+    let inner = match crypto.open(p.key, n, hdr, body) {
+        Ok(x) => x
+        Err(e) => return Err(alert.protocol(alert.BadRecordMac, "bad record MAC"))
+    }
+    p.seq += 1
+    // the content type is the last non-zero byte; what follows is padding
+    let mut i = inner.len()
+    while i > 0 && inner[i - 1] == 0 { i -= 1 }
+    if i == 0 { return Err(alert.protocol(alert.UnexpectedMessage, "record with no content type")) }
+    if i - 1 > MAX_PLAINTEXT { return Err(alert.protocol(alert.RecordOverflow, "inner plaintext too long")) }
+    Ok(Opened(inner[i - 1], wire.slice(inner, 0, i - 1)))
+}
+
+/// One framed record found in a buffer.
+pub type Parsed =
+    | NeedMore(total: usize)
+    | Record(ctype: u8, hdr: List[u8], body: List[u8], used: usize)
+    | Bad(a: alert.Alert, why: String)
+
+/// Frames the first record in `buf` from offset `at`. `limit` is the longest body accepted
+/// (MAX_PLAINTEXT before encryption starts, MAX_PROTECTED after). `NeedMore` says how many
+/// bytes from `at` the record needs altogether (5 until the header is complete).
+pub fn parse(buf: List[u8], at: usize, limit: usize) -> Parsed {
+    let avail = buf.len() - at
+    if avail < 5 { return NeedMore(5) }
+    let ct = buf[at]
+    if ct != CHANGE_CIPHER_SPEC && ct != ALERT && ct != HANDSHAKE && ct != APPLICATION_DATA {
+        return Bad(alert.UnexpectedMessage, String.from("unknown record type"))
+    }
+    // legacy_record_version: 0x03 0x01 .. 0x03 0x03 (0x0301 is what some ClientHellos use)
+    if buf[at + 1] != 3 || buf[at + 2] > 3 {
+        return Bad(alert.ProtocolVersion, String.from("not a TLS record"))
+    }
+    let len = ((buf[at + 3] as usize) << 8) | (buf[at + 4] as usize)
+    if len > limit { return Bad(alert.RecordOverflow, String.from("record too long")) }
+    if avail < 5 + len { return NeedMore(5 + len) }
+    Record(ct, wire.slice(buf, at, at + 5), wire.slice(buf, at + 5, at + 5 + len), 5 + len)
+}

@@ -1,0 +1,16 @@
+import std.io
+import std.bytes
+import crypto
+import tls.alert
+import tls.wire
+import tls.ct
+import tls.suite
+import tls.keys
+import tls.record
+import tls.asn1
+import tls.pem
+import tls.x509
+
+fn main() uses io {
+    io.outln("ok".bytes())
+}

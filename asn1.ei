@@ -1,0 +1,263 @@
+//! tls.asn1: a strict ASN.1 DER reader (ITU-T X.690 section 10 and RFC 5280's use of it).
+//! Every element is bounds-checked against the one that contains it. Rejected, not repaired:
+//! multi-byte tags, indefinite lengths, lengths that are not minimal, lengths over three
+//! bytes (16 MiB), an element that runs past its parent, and (in the helpers that read a
+//! value) a BOOLEAN that is not 0x00 or 0xFF, a non-minimal INTEGER, a BIT STRING whose
+//! unused bits are not zero. The readers return `None`; none of them can panic on any input.
+
+pub const BOOLEAN: u8 = 1
+pub const INTEGER: u8 = 2
+pub const BIT_STRING: u8 = 3
+pub const OCTET_STRING: u8 = 4
+pub const NULL: u8 = 5
+pub const OID: u8 = 6
+pub const UTF8_STRING: u8 = 12
+pub const PRINTABLE_STRING: u8 = 19
+pub const IA5_STRING: u8 = 22
+pub const UTC_TIME: u8 = 23
+pub const GENERALIZED_TIME: u8 = 24
+pub const SEQUENCE: u8 = 48
+pub const SET: u8 = 49
+
+/// Context-specific, constructed `[n]`: 0xA0 + n.
+pub fn explicit(n: u8) -> u8 { 160 + n }
+
+/// Context-specific, primitive `[n]`: 0x80 + n.
+pub fn implicit(n: u8) -> u8 { 128 + n }
+
+/// One element: its tag, its content `b[start..end]`, and where it begins (`at`).
+pub type Tlv = { tag: u8, at: usize, start: usize, end: usize }
+
+/// A cursor over `b[i..end]`.
+pub type Dr = { b: List[u8], i: usize, end: usize }
+
+pub fn reader(b: List[u8]) -> Dr {
+    let n = b.len()
+    Dr(b, 0, n)
+}
+
+/// A reader on the content of `t`.
+pub fn into(d: Dr, t: Tlv) -> Dr { Dr(d.b, t.start, t.end) }
+
+pub fn done(d: Dr) -> bool { d.i >= d.end }
+
+/// The whole element `t` (header and content), copied.
+pub fn raw(d: Dr, t: Tlv) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut k = t.at.copy()
+    while k < t.end {
+        out.push(d.b[k])
+        k += 1
+    }
+    out
+}
+
+/// The content of `t`, copied.
+pub fn content(d: Dr, t: Tlv) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut k = t.start.copy()
+    while k < t.end {
+        out.push(d.b[k])
+        k += 1
+    }
+    out
+}
+
+/// The next element, which becomes consumed.
+pub fn next(inout d: Dr) -> Option[Tlv] {
+    if d.end - d.i < 2 { return None }
+    let tag = d.b[d.i]
+    if (tag & 31) == 31 { return None }
+    let l0 = d.b[d.i + 1] as usize
+    let mut pos = d.i + 2
+    let mut len: usize = 0
+    if l0 < 128 {
+        len = l0
+    } else {
+        let nb = l0 - 128
+        if nb == 0 || nb > 3 { return None }
+        if d.end - pos < nb { return None }
+        if d.b[pos] == 0 { return None }
+        let mut k: usize = 0
+        while k < nb {
+            len = (len << 8) | (d.b[pos + k] as usize)
+            k += 1
+        }
+        pos += nb
+        // minimal: the long form is only for lengths of 128 and over
+        if len < 128 { return None }
+    }
+    if d.end - pos < len { return None }
+    let t = Tlv(tag, d.i, pos, pos + len)
+    d.i = pos + len
+    Some(t)
+}
+
+/// The next element if it has tag `tag`; otherwise `None` and `d` is not moved.
+pub fn expect(inout d: Dr, tag: u8) -> Option[Tlv] {
+    let save = d.i.copy()
+    let t = next(inout d)?
+    if t.tag != tag {
+        d.i = save
+        return None
+    }
+    Some(t)
+}
+
+/// The tag of the next element without consuming it.
+pub fn peek_tag(d: Dr) -> Option[u8] {
+    if d.i >= d.end { return None }
+    Some(d.b[d.i])
+}
+
+/// A BOOLEAN's value.
+pub fn boolean(d: Dr, t: Tlv) -> Option[bool] {
+    if t.tag != BOOLEAN || t.end - t.start != 1 { return None }
+    let v = d.b[t.start]
+    if v == 0 { return Some(false) }
+    if v == 255 { return Some(true) }
+    None
+}
+
+/// A non-negative INTEGER's big-endian bytes without the sign byte, or `None` for a
+/// negative or non-minimal one.
+pub fn uint_bytes(d: Dr, t: Tlv) -> Option[List[u8]] {
+    if t.tag != INTEGER || t.end == t.start { return None }
+    if d.b[t.start] >= 128 { return None }
+    if t.end - t.start > 1 && d.b[t.start] == 0 && d.b[t.start + 1] < 128 { return None }
+    let mut from = t.start.copy()
+    if d.b[from] == 0 && t.end - t.start > 1 { from += 1 }
+    let mut out: List[u8] = List.new()
+    while from < t.end {
+        out.push(d.b[from])
+        from += 1
+    }
+    Some(out)
+}
+
+/// A small non-negative INTEGER (up to 2^31 - 1).
+pub fn small_uint(d: Dr, t: Tlv) -> Option[u32] {
+    let b = uint_bytes(d, t)?
+    if b.len() > 4 { return None }
+    let mut v: u64 = 0
+    for x in b { v = (v << 8) | (x as u64) }
+    if v > 2147483647 { return None }
+    Some(v as u32)
+}
+
+/// A BIT STRING's bytes when its unused-bits count is zero (public keys, signatures).
+pub fn bits_whole(d: Dr, t: Tlv) -> Option[List[u8]] {
+    if t.tag != BIT_STRING || t.end - t.start < 1 { return None }
+    if d.b[t.start] != 0 { return None }
+    let mut out: List[u8] = List.new()
+    let mut k = t.start + 1
+    while k < t.end {
+        out.push(d.b[k])
+        k += 1
+    }
+    Some(out)
+}
+
+/// A BIT STRING of named bits (KeyUsage) as a mask: bit 0 (the first named bit) is 0x8000.
+/// DER requires trailing zero bits to be removed, so the last used bit is set.
+pub fn named_bits(d: Dr, t: Tlv) -> Option[u32] {
+    if t.tag != BIT_STRING || t.end - t.start < 1 { return None }
+    let unused = d.b[t.start] as usize
+    let nbytes = t.end - t.start - 1
+    if unused > 7 || (nbytes == 0 && unused != 0) || nbytes > 2 { return None }
+    let mut v: u32 = 0
+    let mut k: usize = 0
+    while k < nbytes {
+        v = v | ((d.b[t.start + 1 + k] as u32) << ((8 + 8 * (1 - k)) as u32))
+        k += 1
+    }
+    // the unused bits are zero
+    if nbytes > 0 {
+        let last = d.b[t.end - 1] as u32
+        if (last & ((1 << (unused as u32)) - 1)) != 0 { return None }
+    }
+    Some(v >> 8)
+}
+
+/// Content of `t` equals `want`.
+pub fn eq(d: Dr, t: Tlv, want: List[u8]) -> bool {
+    if t.end - t.start != want.len() { return false }
+    let mut k: usize = 0
+    while k < want.len() {
+        if d.b[t.start + k] != want[k] { return false }
+        k += 1
+    }
+    true
+}
+
+/// Is `t` an OID with exactly these content octets?
+pub fn is_oid(d: Dr, t: Tlv, want: List[u8]) -> bool { t.tag == OID && eq(d, t, want) }
+
+// ------------------------------------------------------------------ times
+
+fn digit(b: List[u8], at: usize) -> Option[i64] {
+    if at >= b.len() { return None }
+    let c = b[at]
+    if c < 48 || c > 57 { return None }
+    Some((c - 48) as i64)
+}
+
+fn two(b: List[u8], at: usize) -> Option[i64] { Some(digit(b, at)? * 10 + digit(b, at + 1)?) }
+
+fn is_leap(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+
+fn days_in(y: i64, m: i64) -> i64 {
+    match m {
+        1 => 31
+        2 => if is_leap(y) { 29 } else { 28 }
+        3 => 31
+        4 => 30
+        5 => 31
+        6 => 30
+        7 => 31
+        8 => 31
+        9 => 30
+        10 => 31
+        11 => 30
+        _ => 31
+    }
+}
+
+/// Days from 1970-01-01 to y-m-d (proleptic Gregorian).
+pub fn days_from_civil(y0: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y0 - 1 } else { y0 }
+    let era = if y >= 0 { y / 400 } else { (y - 399) / 400 }
+    let yoe = y - era * 400
+    let mp = if m > 2 { m - 3 } else { m + 9 }
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+/// An RFC 5280 Time (UTCTime `YYMMDDHHMMSSZ` or GeneralizedTime `YYYYMMDDHHMMSSZ`, always
+/// UTC and with seconds) as Unix seconds.
+pub fn time(d: Dr, t: Tlv) -> Option[i64] {
+    let b = content(d, t)
+    let mut y: i64 = 0
+    let mut at: usize = 0
+    if t.tag == UTC_TIME {
+        if b.len() != 13 { return None }
+        let yy = two(b, 0)?
+        y = if yy >= 50 { 1900 + yy } else { 2000 + yy }
+        at = 2
+    } else if t.tag == GENERALIZED_TIME {
+        if b.len() != 15 { return None }
+        y = two(b, 0)? * 100 + two(b, 2)?
+        at = 4
+    } else {
+        return None
+    }
+    let mo = two(b, at)?
+    let dd = two(b, at + 2)?
+    let hh = two(b, at + 4)?
+    let mi = two(b, at + 6)?
+    let ss = two(b, at + 8)?
+    if b[at + 10] != 90 { return None }
+    if mo < 1 || mo > 12 || dd < 1 || dd > days_in(y, mo) || hh > 23 || mi > 59 || ss > 59 { return None }
+    Some(days_from_civil(y, mo, dd) * 86400 + hh * 3600 + mi * 60 + ss)
+}

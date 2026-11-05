@@ -1,0 +1,54 @@
+//! tls.ct: comparisons of secrets without a branch or an early exit that depends on their
+//! values. Only the lengths (not secret in TLS: Finished, tags and keys have fixed sizes)
+//! are compared with a branch. The package compares every MAC, tag and Finished value with
+//! `eq`; `eq_pure` is the same function in Eider (for the tests, and where the backend's
+//! `CRYPTO_memcmp` is not wanted).
+
+import crypto
+
+/// Bytes equal, in time that depends only on the length: the backend's `CRYPTO_memcmp`.
+pub fn eq(a: List[u8], b: List[u8]) -> bool {
+    if a.len() != b.len() { return false }
+    crypto.ct_equal(a, b)
+}
+
+/// 1 if `x` is not zero, else 0, without a branch.
+pub fn nonzero(x: u32) -> u32 {
+    let zero: u32 = 0
+    (x | (zero -% x)) >> 31
+}
+
+/// 0xffffffff if `a == b`, else 0.
+pub fn mask_eq(a: u32, b: u32) -> u32 {
+    let zero: u32 = 0
+    zero -% (1 -% nonzero(a ^ b))
+}
+
+/// 0xffffffff if `a < b`, else 0 (for values below 2^31).
+pub fn mask_lt(a: u32, b: u32) -> u32 {
+    let zero: u32 = 0
+    zero -% ((a -% b) >> 31)
+}
+
+/// `a` where `mask` is all ones, else `b`.
+pub fn select(mask: u32, a: u32, b: u32) -> u32 { (mask & a) | (~mask & b) }
+
+/// Bytes equal without a data-dependent branch: the XOR of every pair is or-ed together, so
+/// the loop always runs to the end of the shorter list. Lists of different length are unequal.
+pub fn eq_pure(a: List[u8], b: List[u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let mut acc: u32 = 0
+    let mut i: usize = 0
+    while i < a.len() {
+        acc = acc | ((a[i] ^ b[i]) as u32)
+        i += 1
+    }
+    nonzero(acc) == 0
+}
+
+/// True if every byte is zero (no early exit).
+pub fn all_zero(a: List[u8]) -> bool {
+    let mut acc: u32 = 0
+    for x in a { acc = acc | (x as u32) }
+    nonzero(acc) == 0
+}

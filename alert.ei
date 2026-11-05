@@ -1,0 +1,184 @@
+//! tls.alert: TLS alerts (RFC 8446 section 6) and the package's error type.
+
+import std.stream
+
+/// The alerts TLS 1.3 defines (and the two TLS 1.2 ones a 1.3 peer may still send).
+pub type Alert =
+    | CloseNotify
+    | UnexpectedMessage
+    | BadRecordMac
+    | RecordOverflow
+    | HandshakeFailure
+    | BadCertificate
+    | UnsupportedCertificate
+    | CertificateRevoked
+    | CertificateExpired
+    | CertificateUnknown
+    | IllegalParameter
+    | UnknownCa
+    | AccessDenied
+    | DecodeError
+    | DecryptError
+    | ProtocolVersion
+    | InsufficientSecurity
+    | InternalError
+    | InappropriateFallback
+    | UserCanceled
+    | MissingExtension
+    | UnsupportedExtension
+    | UnrecognizedName
+    | BadCertificateStatusResponse
+    | UnknownPskIdentity
+    | CertificateRequired
+    | NoApplicationProtocol
+    | UnknownAlert
+
+/// The wire value of an alert description.
+pub fn code(a: Alert) -> u8 {
+    match a {
+        CloseNotify => 0
+        UnexpectedMessage => 10
+        BadRecordMac => 20
+        RecordOverflow => 22
+        HandshakeFailure => 40
+        BadCertificate => 42
+        UnsupportedCertificate => 43
+        CertificateRevoked => 44
+        CertificateExpired => 45
+        CertificateUnknown => 46
+        IllegalParameter => 47
+        UnknownCa => 48
+        AccessDenied => 49
+        DecodeError => 50
+        DecryptError => 51
+        ProtocolVersion => 70
+        InsufficientSecurity => 71
+        InternalError => 80
+        InappropriateFallback => 86
+        UserCanceled => 90
+        MissingExtension => 109
+        UnsupportedExtension => 110
+        UnrecognizedName => 112
+        BadCertificateStatusResponse => 113
+        UnknownPskIdentity => 115
+        CertificateRequired => 116
+        NoApplicationProtocol => 120
+        UnknownAlert => 255
+    }
+}
+
+/// The alert for a wire value (`UnknownAlert` for one this package does not know).
+pub fn from_code(c: u8) -> Alert {
+    match c {
+        0 => CloseNotify
+        10 => UnexpectedMessage
+        20 => BadRecordMac
+        22 => RecordOverflow
+        40 => HandshakeFailure
+        42 => BadCertificate
+        43 => UnsupportedCertificate
+        44 => CertificateRevoked
+        45 => CertificateExpired
+        46 => CertificateUnknown
+        47 => IllegalParameter
+        48 => UnknownCa
+        49 => AccessDenied
+        50 => DecodeError
+        51 => DecryptError
+        70 => ProtocolVersion
+        71 => InsufficientSecurity
+        80 => InternalError
+        86 => InappropriateFallback
+        90 => UserCanceled
+        109 => MissingExtension
+        110 => UnsupportedExtension
+        112 => UnrecognizedName
+        113 => BadCertificateStatusResponse
+        115 => UnknownPskIdentity
+        116 => CertificateRequired
+        120 => NoApplicationProtocol
+        _ => UnknownAlert
+    }
+}
+
+pub fn name(a: Alert) -> str {
+    match a {
+        CloseNotify => "close_notify"
+        UnexpectedMessage => "unexpected_message"
+        BadRecordMac => "bad_record_mac"
+        RecordOverflow => "record_overflow"
+        HandshakeFailure => "handshake_failure"
+        BadCertificate => "bad_certificate"
+        UnsupportedCertificate => "unsupported_certificate"
+        CertificateRevoked => "certificate_revoked"
+        CertificateExpired => "certificate_expired"
+        CertificateUnknown => "certificate_unknown"
+        IllegalParameter => "illegal_parameter"
+        UnknownCa => "unknown_ca"
+        AccessDenied => "access_denied"
+        DecodeError => "decode_error"
+        DecryptError => "decrypt_error"
+        ProtocolVersion => "protocol_version"
+        InsufficientSecurity => "insufficient_security"
+        InternalError => "internal_error"
+        InappropriateFallback => "inappropriate_fallback"
+        UserCanceled => "user_canceled"
+        MissingExtension => "missing_extension"
+        UnsupportedExtension => "unsupported_extension"
+        UnrecognizedName => "unrecognized_name"
+        BadCertificateStatusResponse => "bad_certificate_status_response"
+        UnknownPskIdentity => "unknown_psk_identity"
+        CertificateRequired => "certificate_required"
+        NoApplicationProtocol => "no_application_protocol"
+        UnknownAlert => "unknown_alert"
+    }
+}
+
+/// Where a failure came from.
+pub type Kind =
+    | Protocol
+    | Certificate
+    | Io
+    | PeerAlert
+    | Truncated
+    | Usage
+
+/// A TLS failure. `alert` is the alert this side sent for it (or the one the peer sent, for
+/// `PeerAlert`); `Io` carries the stream's kind in `io_kind`; `Truncated` is a connection
+/// that ended without close_notify.
+pub type Error = { kind: Kind, alert: Alert, message: String, io_kind: stream.Kind }
+
+pub fn fail(kind: Kind, a: Alert, message: str) -> Error {
+    Error(kind, a, String.from(message), stream.Other)
+}
+
+pub fn protocol(a: Alert, message: str) -> Error { fail(Protocol, a, message) }
+
+pub fn io_error(e: stream.Error) -> Error {
+    Error(Io, InternalError, e.message, e.kind)
+}
+
+impl Show for Error {
+    fn show(self, inout out: String) {
+        out.push_str("tls: ")
+        out.append(self.message.copy())
+        match self.kind {
+            PeerAlert => {
+                out.push_str(" (alert ")
+                out.push_str(name(self.alert))
+                out.push_str(")")
+            }
+            Protocol => {
+                out.push_str(" (sent alert ")
+                out.push_str(name(self.alert))
+                out.push_str(")")
+            }
+            Certificate => {
+                out.push_str(" (sent alert ")
+                out.push_str(name(self.alert))
+                out.push_str(")")
+            }
+            _ => {}
+        }
+    }
+}

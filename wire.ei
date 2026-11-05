@@ -1,0 +1,177 @@
+//! tls.wire: the TLS presentation language (RFC 8446 section 3): bounds-checked readers over
+//! a byte list and writers for the length-prefixed vectors. A reader never panics: every
+//! read past its end is `None`, and a sub-reader (`vec8`, `vec16`, `vec24`, `take`) cannot
+//! read beyond the length its prefix declared.
+
+import std.encoding
+
+/// A cursor on `b[i..end]`.
+pub type Rd = { b: List[u8], i: usize, end: usize }
+
+pub fn rd(b: List[u8]) -> Rd {
+    let n = b.len()
+    Rd(b, 0, n)
+}
+
+/// Bytes not yet read.
+pub fn left(r: Rd) -> usize { r.end - r.i }
+
+pub fn done(r: Rd) -> bool { r.i >= r.end }
+
+pub fn get_u8(inout r: Rd) -> Option[u8] {
+    if r.i >= r.end { return None }
+    let v = r.b[r.i]
+    r.i += 1
+    Some(v)
+}
+
+pub fn get_u16(inout r: Rd) -> Option[u32] {
+    if r.end - r.i < 2 { return None }
+    let v = ((r.b[r.i] as u32) << 8) | (r.b[r.i + 1] as u32)
+    r.i += 2
+    Some(v)
+}
+
+pub fn get_u24(inout r: Rd) -> Option[u32] {
+    if r.end - r.i < 3 { return None }
+    let v = ((r.b[r.i] as u32) << 16) | ((r.b[r.i + 1] as u32) << 8) | (r.b[r.i + 2] as u32)
+    r.i += 3
+    Some(v)
+}
+
+pub fn get_u32(inout r: Rd) -> Option[u32] {
+    if r.end - r.i < 4 { return None }
+    let v = ((r.b[r.i] as u32) << 24) | ((r.b[r.i + 1] as u32) << 16) | ((r.b[r.i + 2] as u32) << 8) | (r.b[r.i + 3] as u32)
+    r.i += 4
+    Some(v)
+}
+
+/// The next `n` bytes, copied.
+pub fn get_bytes(inout r: Rd, n: usize) -> Option[List[u8]] {
+    if r.end - r.i < n { return None }
+    let mut out: List[u8] = List.new()
+    let stop = r.i + n
+    let mut k = r.i.copy()
+    while k < stop {
+        out.push(r.b[k])
+        k += 1
+    }
+    r.i = stop
+    Some(out)
+}
+
+/// A reader on the next `n` bytes; `r` moves past them.
+pub fn take(inout r: Rd, n: usize) -> Option[Rd] {
+    if r.end - r.i < n { return None }
+    let sub = Rd(r.b, r.i, r.i + n)
+    r.i += n
+    Some(sub)
+}
+
+pub fn skip(inout r: Rd, n: usize) -> bool {
+    if r.end - r.i < n { return false }
+    r.i += n
+    true
+}
+
+/// The contents of a vector with a 1-, 2- or 3-byte length prefix.
+pub fn vec8(inout r: Rd) -> Option[Rd] {
+    let n = get_u8(inout r)?
+    take(inout r, n as usize)
+}
+
+pub fn vec16(inout r: Rd) -> Option[Rd] {
+    let n = get_u16(inout r)?
+    take(inout r, n as usize)
+}
+
+pub fn vec24(inout r: Rd) -> Option[Rd] {
+    let n = get_u24(inout r)?
+    take(inout r, n as usize)
+}
+
+/// The unread bytes, copied; `r` is at its end.
+pub fn rest(inout r: Rd) -> List[u8] {
+    let n = r.end - r.i
+    match get_bytes(inout r, n) {
+        Some(b) => b
+        None => List.new()
+    }
+}
+
+// ------------------------------------------------------------------ writers
+
+pub fn put_u8(inout o: List[u8], v: u32) { o.push((v & 255) as u8) }
+
+pub fn put_u16(inout o: List[u8], v: u32) {
+    o.push(((v >> 8) & 255) as u8)
+    o.push((v & 255) as u8)
+}
+
+pub fn put_u24(inout o: List[u8], v: u32) {
+    o.push(((v >> 16) & 255) as u8)
+    o.push(((v >> 8) & 255) as u8)
+    o.push((v & 255) as u8)
+}
+
+pub fn put_u32(inout o: List[u8], v: u32) {
+    o.push(((v >> 24) & 255) as u8)
+    o.push(((v >> 16) & 255) as u8)
+    o.push(((v >> 8) & 255) as u8)
+    o.push((v & 255) as u8)
+}
+
+pub fn put(inout o: List[u8], b: List[u8]) {
+    for x in b { o.push(x) }
+}
+
+// The length prefixes are masked, never trapping: a body longer than its prefix allows is a
+// caller error that serializers rule out by validating their inputs (config.ei).
+pub fn put_vec8(inout o: List[u8], body: List[u8]) {
+    put_u8(inout o, (body.len() & 255) as u32)
+    put(inout o, body)
+}
+
+pub fn put_vec16(inout o: List[u8], body: List[u8]) {
+    put_u16(inout o, (body.len() & 65535) as u32)
+    put(inout o, body)
+}
+
+pub fn put_vec24(inout o: List[u8], body: List[u8]) {
+    put_u24(inout o, (body.len() & 16777215) as u32)
+    put(inout o, body)
+}
+
+pub fn slice(b: List[u8], from: usize, to: usize) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut k = from.copy()
+    while k < to && k < b.len() {
+        out.push(b[k])
+        k += 1
+    }
+    out
+}
+
+/// The bytes of a hex string (empty if it is not valid hex): constants and test vectors.
+pub fn hex(s: str) -> List[u8] {
+    match encoding.unhex(s.bytes()) {
+        Ok(b) => b
+        Err(_) => List.new()
+    }
+}
+
+pub fn zeros(n: usize) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut k: usize = 0
+    while k < n {
+        out.push(0)
+        k += 1
+    }
+    out
+}
+
+pub fn concat(a: List[u8], b: List[u8]) -> List[u8] {
+    let mut out = a.copy()
+    put(inout out, b)
+    out
+}

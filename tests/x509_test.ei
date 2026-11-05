@@ -1,0 +1,157 @@
+// X.509: parsing the fixtures in tests/pki, chain validation (the good chains and every way a
+// chain can be wrong), host name matching and the DER time rules. `now` is fixed so the
+// result does not depend on the date the test runs.
+
+import std.bytes
+import std.fs
+import std.io
+import tls.asn1
+import tls.pem
+import tls.x509
+
+fn load(name: str) -> List[u8] uses fs, io {
+    let mut p = "tests/pki/".bytes()
+    bytes.append(inout p, name.bytes())
+    match fs.read(p) {
+        Ok(b) => b
+        Err(e) => {
+            print("cannot read {name}: {e}")
+            List.new()
+        }
+    }
+}
+
+fn certs(name: str) -> List[x509.Cert] uses fs, io {
+    let mut out: List[x509.Cert] = List.new()
+    match pem.decode_all(load(name)) {
+        Ok(blocks) => {
+            for b in blocks {
+                match x509.parse(b.der) {
+                    Ok(c) => out.push(c)
+                    Err(e) => print("parse {name}: {e}")
+                }
+            }
+        }
+        Err(e) => print("pem {name}: {e}")
+    }
+    out
+}
+
+fn one(name: str) -> x509.Cert uses fs, io { certs(name)[0].copy() }
+
+fn store_of(name: str) -> x509.Store uses fs, io {
+    let mut s = x509.empty_store()
+    for c in certs(name) { s.roots.push(c) }
+    s
+}
+
+fn l1(a: x509.Cert) -> List[x509.Cert] {
+    let mut out: List[x509.Cert] = List.new()
+    out.push(a)
+    out
+}
+
+fn l2(a: x509.Cert, b: x509.Cert) -> List[x509.Cert] {
+    let mut out = l1(a)
+    out.push(b)
+    out
+}
+
+fn l3(a: x509.Cert, b: x509.Cert, c: x509.Cert) -> List[x509.Cert] {
+    let mut out = l2(a, b)
+    out.push(c)
+    out
+}
+
+fn dnsm(pat: str, h: str) -> bool { x509.dns_matches(pat.bytes(), h.bytes()) }
+
+fn dns_line(pat: str, h: str) uses io {
+    let r = dnsm(pat, h)
+}
+
+fn show(label: str, r: Result[x509.Cert, x509.Failure]) uses io {
+    match r {
+        Ok(a) => print("{label}: ok")
+        Err(f) => print("{label}: {x509.reason_text(f.reason)}")
+    }
+}
+
+fn host(s: str) -> Option[List[u8]] { Some(s.bytes()) }
+
+fn main() uses io, fs {
+    // 2026-11-06 12:00:00 UTC
+    let now = asn1.days_from_civil(2026, 11, 6) * 86400 + 43200
+    let root = store_of("root.pem")
+    let ed = certs("edchain.pem")
+    let leaf = ed[0].copy()
+    print("chain of {ed.len()} certificates")
+    print("leaf: version {leaf.version}, key {leaf.key_kind}, ca {leaf.is_ca}, dns {leaf.dns.len()}, ips {leaf.ips.len()}")
+    print("inter: ca {ed[1].is_ca}, path_len {ed[1].path_len}")
+    print("root: ca {root.roots[0].is_ca}, path_len {root.roots[0].path_len}")
+    print("validity: {leaf.not_before < now && now < leaf.not_after}")
+
+    show("ed chain via intermediate", x509.verify_chain(ed, root, now, x509.ServerAuth, host("localhost")))
+    show("ed chain, ip 127.0.0.1", x509.verify_chain(ed, root, now, x509.ServerAuth, host("127.0.0.1")))
+    show("ed chain, ip ::1", x509.verify_chain(ed, root, now, x509.ServerAuth, host("::1")))
+    show("ed chain, wildcard", x509.verify_chain(ed, root, now, x509.ServerAuth, host("www.example.test")))
+    show("ed chain, wrong name", x509.verify_chain(ed, root, now, x509.ServerAuth, host("example.org")))
+    show("ed chain, no name check", x509.verify_chain(ed, root, now, x509.ServerAuth, None))
+    show("ed chain, ip 10.0.0.1", x509.verify_chain(ed, root, now, x509.ServerAuth, host("10.0.0.1")))
+    // the leaf alone, without the intermediate
+    show("ed leaf alone", x509.verify_chain(l1(leaf), root, now, x509.ServerAuth, host("localhost")))
+    // the intermediates may come in any order, and extra certificates are ignored
+    show("ed chain with the root appended", x509.verify_chain(l3(ed[0].copy(), ed[1].copy(), one("root.pem")), root, now, x509.ServerAuth, host("localhost")))
+    show("ec leaf", x509.verify_chain(certs("ec.pem"), root, now, x509.ServerAuth, host("localhost")))
+    show("untrusted root", x509.verify_chain(ed, store_of("other-root.pem"), now, x509.ServerAuth, host("localhost")))
+    show("empty store", x509.verify_chain(ed, x509.empty_store(), now, x509.ServerAuth, host("localhost")))
+    show("expired leaf", x509.verify_chain(certs("expired.pem"), root, now, x509.ServerAuth, host("localhost")))
+    show("not yet valid", x509.verify_chain(ed, root, now - 400 * 86400, x509.ServerAuth, host("localhost")))
+    show("after the end", x509.verify_chain(ed, root, now + 4000 * 86400, x509.ServerAuth, host("localhost")))
+    show("client cert as server", x509.verify_chain(certs("noeku.pem"), root, now, x509.ServerAuth, host("localhost")))
+    show("client cert as client", x509.verify_chain(certs("client.pem"), root, now, x509.ClientAuth, None))
+    show("server cert as client", x509.verify_chain(certs("ec.pem"), root, now, x509.ClientAuth, None))
+    // a leaf cannot issue: ed.pem is not a CA, so a chain through it fails
+    show("extra certificate ignored", x509.verify_chain(l2(certs("client.pem")[0].copy(), certs("ec.pem")[0].copy()), store_of("root.pem"), now, x509.ClientAuth, None))
+    show("leaf as issuer", x509.verify_chain(l3(certs("leafsigned.pem")[0].copy(), ed[0].copy(), ed[1].copy()), root, now, x509.ServerAuth, None))
+    show("no certificate", x509.verify_chain(List.new(), root, now, x509.ServerAuth, None))
+    // the leaf is itself the trust anchor
+    show("pinned leaf", x509.verify_chain(l1(leaf), store_of("ed.pem"), now, x509.ServerAuth, host("localhost")))
+    // a tampered signature
+    let mut bad = leaf.copy()
+    bad.sig[0] = bad.sig[0] ^ 1
+    show("tampered signature", x509.verify_chain(l2(bad, ed[1].copy()), root, now, x509.ServerAuth, host("localhost")))
+    // a tampered TBS: the name changed after signing
+    let mut bad2 = leaf.copy()
+    bad2.tbs[bad2.tbs.len() - 1] = bad2.tbs[bad2.tbs.len() - 1] ^ 1
+    show("tampered tbs", x509.verify_chain(l2(bad2, ed[1].copy()), root, now, x509.ServerAuth, host("localhost")))
+
+    // host names (RFC 6125)
+    let names2 = ["a.example.test", "A.EXAMPLE.TEST", "a.example.test.", "example.test", "a.b.example.test", ".example.test", "localhost", "LOCALHOST", "localhost.", "evil.com"]
+    for n in names2 {
+        print("match {n}: {x509.matches_host(leaf, n.bytes())}")
+    }
+
+    dns_line("*.com", "a.com")
+    dns_line("a.*.com", "a.b.com")
+    dns_line("f*.example.com", "foo.example.com")
+    dns_line("*.example.com", "foo.example.com")
+    dns_line("*.example.com", "example.com")
+    dns_line("*.example.com", "a.b.example.com")
+    dns_line("*.example.com", ".example.com")
+    dns_line("example.com", "example.com")
+    dns_line("example.com", "EXAMPLE.com.")
+
+    // IP literals
+    for t in ["1.2.3.4", "1.2.3", "1.2.3.4.5", "256.1.1.1", "01.2.3.4", "::1", "::", "1::2", "1:2:3:4:5:6:7:8", "1:2:3:4:5:6:7", "1::2::3", ":1", "1:", "::ffff", "fe80::1:2", "12345::", "localhost"] {
+        match x509.parse_ip(t.bytes()) {
+            Some(ip) => print("ip {t}: {ip.len()} bytes, last {ip[ip.len() - 1]}")
+            None => print("ip {t}: no")
+        }
+    }
+
+    // DER times
+    let t1 = asn1.days_from_civil(1970, 1, 1)
+    let t2 = asn1.days_from_civil(2000, 3, 1)
+    let t3 = asn1.days_from_civil(2038, 1, 19)
+    print("days {t1} {t2} {t3}")
+}

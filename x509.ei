@@ -1,0 +1,766 @@
+//! tls.x509: X.509 v3 certificates (RFC 5280): a strict DER parser, signature checks with
+//! Ed25519 and ECDSA P-256 / SHA-256, hostname matching (RFC 6125: SAN dNSName with a
+//! leftmost-label wildcard, SAN iPAddress; the subject CN is not used), and chain building
+//! and validation against a trust store.
+//!
+//! What it checks on a chain: every certificate's validity window; that each issuer is a CA
+//! (basicConstraints cA, keyUsage keyCertSign when present) and its pathLenConstraint; that
+//! each signature verifies under its issuer's key; the leaf's extendedKeyUsage and keyUsage
+//! for the purpose; no unknown critical extension and no nameConstraints (failing closed);
+//! and that the chain ends at a trust anchor. It does not check revocation (CRL, OCSP),
+//! certificate policies or name constraints, and it matches issuer to subject names by their
+//! DER bytes, not by RFC 5280's normalised comparison.
+
+import std.bytes
+import std.fs
+import crypto
+import tls.asn1
+import tls.pem
+import tls.wire
+
+pub type KeyKind = | Ed25519Key | P256Key | OtherKey
+
+/// A parsed certificate. `problem` is set when it carries something this package refuses to
+/// validate (an unknown critical extension, name constraints); parsing still succeeds so a
+/// trust bundle with such a root loads, and a chain through it fails.
+pub type Cert = {
+    der: List[u8],
+    tbs: List[u8],
+    sig_alg: List[u8],
+    sig: List[u8],
+    version: u32,
+    serial: List[u8],
+    issuer: List[u8],
+    subject: List[u8],
+    not_before: i64,
+    not_after: i64,
+    key_kind: KeyKind,
+    key: List[u8],
+    has_bc: bool,
+    is_ca: bool,
+    path_len: Option[u32],
+    key_usage: Option[u32],
+    eku_present: bool,
+    eku_server: bool,
+    eku_client: bool,
+    has_san: bool,
+    dns: List[List[u8]],
+    ips: List[List[u8]],
+    ski: Option[List[u8]],
+    aki: Option[List[u8]],
+    problem: Option[String]
+}
+
+pub const KU_DIGITAL_SIGNATURE: u32 = 32768
+pub const KU_KEY_CERT_SIGN: u32 = 1024
+
+// OID contents
+fn oid_ec_public_key() -> List[u8] { wire.hex("2a8648ce3d0201") }
+fn oid_prime256v1() -> List[u8] { wire.hex("2a8648ce3d030107") }
+fn oid_ed25519() -> List[u8] { wire.hex("2b6570") }
+fn oid_ecdsa_sha256() -> List[u8] { wire.hex("2a8648ce3d040302") }
+fn oid_basic_constraints() -> List[u8] { wire.hex("551d13") }
+fn oid_key_usage() -> List[u8] { wire.hex("551d0f") }
+fn oid_san() -> List[u8] { wire.hex("551d11") }
+fn oid_eku() -> List[u8] { wire.hex("551d25") }
+fn oid_name_constraints() -> List[u8] { wire.hex("551d1e") }
+fn oid_ski() -> List[u8] { wire.hex("551d0e") }
+fn oid_aki() -> List[u8] { wire.hex("551d23") }
+fn oid_server_auth() -> List[u8] { wire.hex("2b06010505070301") }
+fn oid_client_auth() -> List[u8] { wire.hex("2b06010505070302") }
+fn oid_any_eku() -> List[u8] { wire.hex("551d2500") }
+
+// extensions that are understood well enough to ignore when critical, or that are only
+// informative: policies, CRL distribution points, authority information access, policy
+// constraints and mappings, inhibit anyPolicy, embedded SCTs, subject directory attributes
+fn ignorable_ext(d: asn1.Dr, t: asn1.Tlv) -> bool {
+    let ok = ["551d20", "551d1f", "2b06010505070101", "551d24", "551d21", "551d36", "2b06010401d679020402", "551d09", "551d10"]
+    for o in ok {
+        if asn1.is_oid(d, t, wire.hex(o)) { return true }
+    }
+    false
+}
+
+type Exts = {
+    has_bc: bool, is_ca: bool, path_len: Option[u32], key_usage: Option[u32],
+    eku_present: bool, eku_server: bool, eku_client: bool,
+    has_san: bool, dns: List[List[u8]], ips: List[List[u8]],
+    ski: Option[List[u8]], aki: Option[List[u8]], problem: Option[String],
+    seen: List[List[u8]]
+}
+
+fn parse_basic_constraints(d: asn1.Dr, body: asn1.Tlv, inout x: Exts) -> Option[()] {
+    let mut r = asn1.into(d, body)
+    let seq = asn1.expect(inout r, asn1.SEQUENCE)?
+    if !asn1.done(r) { return None }
+    let mut s = asn1.into(d, seq)
+    x.has_bc = true
+    x.is_ca = false
+    match asn1.expect(inout s, asn1.BOOLEAN) {
+        Some(b) => { x.is_ca = asn1.boolean(d, b)? }
+        None => {}
+    }
+    match asn1.expect(inout s, asn1.INTEGER) {
+        Some(i) => { x.path_len = Some(asn1.small_uint(d, i)?) }
+        None => {}
+    }
+    if !asn1.done(s) { return None }
+    // a path length only makes sense for a CA
+    if !x.is_ca && x.path_len.is_some() { return None }
+    Some(())
+}
+
+fn valid_dns_char(c: u8) -> bool { c > 32 && c < 127 }
+
+fn parse_san(d: asn1.Dr, body: asn1.Tlv, inout x: Exts) -> Option[()] {
+    let mut r = asn1.into(d, body)
+    let seq = asn1.expect(inout r, asn1.SEQUENCE)?
+    if !asn1.done(r) { return None }
+    let mut s = asn1.into(d, seq)
+    x.has_san = true
+    let mut count: usize = 0
+    while !asn1.done(s) {
+        let g = asn1.next(inout s)?
+        count += 1
+        if count > 1024 { return None }
+        if g.tag == 130 {
+            let name = asn1.content(d, g)
+            if name.len() == 0 { return None }
+            for c in name {
+                if !valid_dns_char(c) { return None }
+            }
+            x.dns.push(name)
+        } else if g.tag == 135 {
+            let ip = asn1.content(d, g)
+            if ip.len() != 4 && ip.len() != 16 { return None }
+            x.ips.push(ip)
+        }
+    }
+    if count == 0 { return None }
+    Some(())
+}
+
+fn parse_eku(d: asn1.Dr, body: asn1.Tlv, inout x: Exts) -> Option[()] {
+    let mut r = asn1.into(d, body)
+    let seq = asn1.expect(inout r, asn1.SEQUENCE)?
+    if !asn1.done(r) { return None }
+    let mut s = asn1.into(d, seq)
+    x.eku_present = true
+    let mut count: usize = 0
+    while !asn1.done(s) {
+        let o = asn1.next(inout s)?
+        if o.tag != asn1.OID { return None }
+        count += 1
+        if count > 64 { return None }
+        if asn1.is_oid(d, o, oid_server_auth()) || asn1.is_oid(d, o, oid_any_eku()) { x.eku_server = true }
+        if asn1.is_oid(d, o, oid_client_auth()) || asn1.is_oid(d, o, oid_any_eku()) { x.eku_client = true }
+    }
+    if count == 0 { return None }
+    Some(())
+}
+
+fn parse_extensions(d: asn1.Dr, wrapper: asn1.Tlv) -> Option[Exts] {
+    let mut x = Exts(false, false, None, None, false, false, false, false, List.new(), List.new(), None, None, None, List.new())
+    let mut w = asn1.into(d, wrapper)
+    let seq = asn1.expect(inout w, asn1.SEQUENCE)?
+    if !asn1.done(w) { return None }
+    let mut s = asn1.into(d, seq)
+    let mut count: usize = 0
+    while !asn1.done(s) {
+        let e = asn1.expect(inout s, asn1.SEQUENCE)?
+        count += 1
+        if count > 256 { return None }
+        let mut er = asn1.into(d, e)
+        let oid = asn1.expect(inout er, asn1.OID)?
+        let mut critical = false
+        match asn1.expect(inout er, asn1.BOOLEAN) {
+            Some(b) => { critical = asn1.boolean(d, b)? }
+            None => {}
+        }
+        let val = asn1.expect(inout er, asn1.OCTET_STRING)?
+        if !asn1.done(er) { return None }
+        // an extension appears at most once
+        let id = asn1.content(d, oid)
+        for prev in x.seen {
+            if bytes.eq(prev, id) { return None }
+        }
+        x.seen.push(id)
+        let inner = asn1.into(d, val)
+        if asn1.is_oid(d, oid, oid_basic_constraints()) {
+            parse_basic_constraints(d, val, inout x)?
+        } else if asn1.is_oid(d, oid, oid_key_usage()) {
+            let mut kr = inner.copy()
+            let bs = asn1.expect(inout kr, asn1.BIT_STRING)?
+            if !asn1.done(kr) { return None }
+            x.key_usage = Some(asn1.named_bits(d, bs)?)
+        } else if asn1.is_oid(d, oid, oid_san()) {
+            parse_san(d, val, inout x)?
+        } else if asn1.is_oid(d, oid, oid_eku()) {
+            parse_eku(d, val, inout x)?
+        } else if asn1.is_oid(d, oid, oid_ski()) {
+            let mut kr = inner.copy()
+            let o = asn1.expect(inout kr, asn1.OCTET_STRING)?
+            x.ski = Some(asn1.content(d, o))
+        } else if asn1.is_oid(d, oid, oid_aki()) {
+            let mut kr = inner.copy()
+            let sq = asn1.expect(inout kr, asn1.SEQUENCE)?
+            let mut a = asn1.into(d, sq)
+            // keyIdentifier [0] is the first field, when there
+            match asn1.expect(inout a, asn1.implicit(0)) {
+                Some(k) => { x.aki = Some(asn1.content(d, k)) }
+                None => {}
+            }
+        } else if asn1.is_oid(d, oid, oid_name_constraints()) {
+            x.problem = Some(String.from("name constraints are not supported"))
+        } else if critical && !ignorable_ext(d, oid) {
+            x.problem = Some(String.from("unknown critical extension"))
+        }
+    }
+    if count == 0 { return None }
+    Some(x)
+}
+
+/// Parses one DER certificate (the whole of `der`, no trailing bytes).
+pub fn parse(der: List[u8]) -> Result[Cert, String] {
+    match parse_opt(der) {
+        Some(c) => Ok(c)
+        None => Err(String.from("x509: malformed certificate"))
+    }
+}
+
+fn parse_opt(der: List[u8]) -> Option[Cert] {
+    let mut top = asn1.reader(der)
+    let cert = asn1.expect(inout top, asn1.SEQUENCE)?
+    if !asn1.done(top) { return None }
+    let mut c = asn1.into(top, cert)
+    let tbs = asn1.expect(inout c, asn1.SEQUENCE)?
+    let sig_alg = asn1.expect(inout c, asn1.SEQUENCE)?
+    let sig_bits = asn1.expect(inout c, asn1.BIT_STRING)?
+    if !asn1.done(c) { return None }
+    let sig = asn1.bits_whole(top, sig_bits)?
+    let mut t = asn1.into(top, tbs)
+    // version [0] EXPLICIT INTEGER DEFAULT v1
+    let mut version: u32 = 0
+    match asn1.expect(inout t, asn1.explicit(0)) {
+        Some(v) => {
+            let mut vr = asn1.into(top, v)
+            let vi = asn1.expect(inout vr, asn1.INTEGER)?
+            if !asn1.done(vr) { return None }
+            version = asn1.small_uint(top, vi)?
+            if version > 2 || version == 0 { return None }
+        }
+        None => {}
+    }
+    let serial_t = asn1.expect(inout t, asn1.INTEGER)?
+    // serial numbers are positive and at most 20 octets (RFC 5280 4.1.2.2)
+    if serial_t.end - serial_t.start > 21 || serial_t.end == serial_t.start { return None }
+    let serial = asn1.content(top, serial_t)
+    let inner_alg = asn1.expect(inout t, asn1.SEQUENCE)?
+    // the two copies of the signature algorithm must agree
+    if !bytes.eq(asn1.raw(top, inner_alg), asn1.raw(top, sig_alg)) { return None }
+    let issuer_t = asn1.expect(inout t, asn1.SEQUENCE)?
+    let validity = asn1.expect(inout t, asn1.SEQUENCE)?
+    let mut vr = asn1.into(top, validity)
+    let nb_t = asn1.next(inout vr)?
+    let na_t = asn1.next(inout vr)?
+    if !asn1.done(vr) { return None }
+    let nb = asn1.time(top, nb_t)?
+    let na = asn1.time(top, na_t)?
+    let subject_t = asn1.expect(inout t, asn1.SEQUENCE)?
+    let spki = asn1.expect(inout t, asn1.SEQUENCE)?
+    // SubjectPublicKeyInfo
+    let mut sp = asn1.into(top, spki)
+    let alg = asn1.expect(inout sp, asn1.SEQUENCE)?
+    let key_bits = asn1.expect(inout sp, asn1.BIT_STRING)?
+    if !asn1.done(sp) { return None }
+    let key = asn1.bits_whole(top, key_bits)?
+    let mut ar = asn1.into(top, alg)
+    let alg_oid = asn1.expect(inout ar, asn1.OID)?
+    let mut key_kind = OtherKey
+    if asn1.is_oid(top, alg_oid, oid_ed25519()) {
+        if !asn1.done(ar) || key.len() != 32 { return None }
+        key_kind = Ed25519Key
+    } else if asn1.is_oid(top, alg_oid, oid_ec_public_key()) {
+        match asn1.expect(inout ar, asn1.OID) {
+            Some(curve) => {
+                if asn1.is_oid(top, curve, oid_prime256v1()) {
+                    if key.len() != 65 || key[0] != 4 { return None }
+                    key_kind = P256Key
+                }
+            }
+            None => {}
+        }
+    }
+    // issuerUniqueID [1], subjectUniqueID [2]: skipped (only in v2 and v3)
+    match asn1.expect(inout t, asn1.implicit(1)) {
+        Some(_) => { if version == 0 { return None } }
+        None => {}
+    }
+    match asn1.expect(inout t, asn1.implicit(2)) {
+        Some(_) => { if version == 0 { return None } }
+        None => {}
+    }
+    let mut x = Exts(false, false, None, None, false, false, false, false, List.new(), List.new(), None, None, None, List.new())
+    match asn1.expect(inout t, asn1.explicit(3)) {
+        Some(e) => {
+            if version != 2 { return None }
+            x = parse_extensions(top, e)?
+        }
+        None => {}
+    }
+    if !asn1.done(t) { return None }
+    Some(Cert(
+        der, asn1.raw(top, tbs), asn1.raw(top, sig_alg), sig, version, serial,
+        asn1.raw(top, issuer_t), asn1.raw(top, subject_t), nb, na, key_kind, key,
+        x.has_bc, x.is_ca, x.path_len, x.key_usage, x.eku_present, x.eku_server, x.eku_client,
+        x.has_san, x.dns, x.ips, x.ski, x.aki, x.problem
+    ))
+}
+
+// ------------------------------------------------------------------ signatures
+
+pub type SigScheme = | SigEd25519 | SigEcdsaSha256 | SigUnsupported
+
+/// The signature algorithm `c` was signed with.
+pub fn sig_scheme(c: Cert) -> SigScheme {
+    let mut d = asn1.reader(c.sig_alg)
+    let seq = match asn1.expect(inout d, asn1.SEQUENCE) {
+        Some(s) => s
+        None => return SigUnsupported
+    }
+    let mut r = asn1.into(d, seq)
+    let oid = match asn1.expect(inout r, asn1.OID) {
+        Some(o) => o
+        None => return SigUnsupported
+    }
+    // both algorithms have absent parameters (RFC 8410, RFC 5758)
+    if !asn1.done(r) { return SigUnsupported }
+    if asn1.is_oid(d, oid, oid_ed25519()) { return SigEd25519 }
+    if asn1.is_oid(d, oid, oid_ecdsa_sha256()) { return SigEcdsaSha256 }
+    SigUnsupported
+}
+
+/// Does `issuer`'s key verify `c`'s signature over its TBSCertificate?
+pub fn signed_by(c: Cert, issuer: Cert) -> bool {
+    match sig_scheme(c) {
+        SigEd25519 => {
+            match issuer.key_kind {
+                Ed25519Key => {
+                    let pk = match crypto.ed25519_public_key(issuer.key) {
+                        Ok(k) => k
+                        Err(_) => return false
+                    }
+                    let sg = match crypto.ed25519_signature(c.sig) {
+                        Ok(s) => s
+                        Err(_) => return false
+                    }
+                    crypto.ed25519_verify(pk, c.tbs, sg)
+                }
+                _ => false
+            }
+        }
+        SigEcdsaSha256 => {
+            match issuer.key_kind {
+                P256Key => {
+                    let pk = match crypto.p256_public_key(issuer.key) {
+                        Ok(k) => k
+                        Err(_) => return false
+                    }
+                    crypto.p256_verify(pk, c.tbs, crypto.p256_signature_der(c.sig))
+                }
+                _ => false
+            }
+        }
+        SigUnsupported => false
+    }
+}
+
+// ------------------------------------------------------------------ names
+
+fn lower(c: u8) -> u8 {
+    if c >= 65 && c <= 90 { return c + 32 }
+    c
+}
+
+fn lower_all(b: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    for c in b { out.push(lower(c)) }
+    out
+}
+
+/// A host name or address literal as bytes: dotted IPv4 or colon-separated IPv6 (with `::`),
+/// else `None`. Brackets are not accepted.
+pub fn parse_ip(host: List[u8]) -> Option[List[u8]] {
+    if host.len() == 0 || host.len() > 45 { return None }
+    let mut has_colon = false
+    for c in host {
+        if c == 58 { has_colon = true }
+    }
+    if !has_colon {
+        let mut out: List[u8] = List.new()
+        let mut cur: u32 = 0
+        let mut digits: usize = 0
+        for c in host {
+            if c == 46 {
+                if digits == 0 || out.len() >= 3 { return None }
+                out.push(cur as u8)
+                cur = 0
+                digits = 0
+            } else if c >= 48 && c <= 57 {
+                // no leading zeros: "010" is ambiguous (octal in some parsers)
+                if digits == 1 && cur == 0 { return None }
+                cur = cur * 10 + ((c - 48) as u32)
+                digits += 1
+                if digits > 3 || cur > 255 { return None }
+            } else {
+                return None
+            }
+        }
+        if digits == 0 || out.len() != 3 { return None }
+        out.push(cur as u8)
+        return Some(out)
+    }
+    // IPv6: groups of hex digits, at most one "::"
+    let mut head: List[u32] = List.new()
+    let mut tail: List[u32] = List.new()
+    let mut in_tail = false
+    let mut seen_gap = false
+    let mut cur: u32 = 0
+    let mut digits: usize = 0
+    let mut i: usize = 0
+    while i < host.len() {
+        let c = host[i]
+        let mut hv: u32 = 99
+        if c >= 48 && c <= 57 { hv = (c - 48) as u32 }
+        if c >= 97 && c <= 102 { hv = (c - 97) as u32 + 10 }
+        if c >= 65 && c <= 70 { hv = (c - 65) as u32 + 10 }
+        if hv < 16 {
+            cur = cur * 16 + hv
+            digits += 1
+            if digits > 4 { return None }
+        } else if c == 58 {
+            if i + 1 < host.len() && host[i + 1] == 58 {
+                if seen_gap { return None }
+                if digits > 0 {
+                    if in_tail { tail.push(cur) } else { head.push(cur) }
+                }
+                cur = 0
+                digits = 0
+                seen_gap = true
+                in_tail = true
+                i += 1
+            } else {
+                if digits == 0 { return None }
+                if in_tail { tail.push(cur) } else { head.push(cur) }
+                cur = 0
+                digits = 0
+            }
+        } else {
+            return None
+        }
+        i += 1
+    }
+    if digits > 0 {
+        if in_tail { tail.push(cur) } else { head.push(cur) }
+    } else if host[host.len() - 1] == 58 && !(host.len() >= 2 && host[host.len() - 2] == 58) {
+        return None
+    }
+    let total = head.len() + tail.len()
+    if seen_gap { if total > 7 { return None } } else { if total != 8 { return None } }
+    let mut groups: List[u32] = head.copy()
+    if seen_gap {
+        let mut z = total.copy()
+        while z < 8 {
+            groups.push(0)
+            z += 1
+        }
+    }
+    for g in tail { groups.push(g) }
+    if groups.len() != 8 { return None }
+    let mut out: List[u8] = List.new()
+    for g in groups {
+        out.push((g >> 8) as u8)
+        out.push((g & 255) as u8)
+    }
+    Some(out)
+}
+
+fn labels(b: List[u8]) -> List[List[u8]] { bytes.split(b, 46) }
+
+/// Does the certificate name pattern `pat` (a SAN dNSName) match `host`? Case-insensitive;
+/// `*` is accepted only as the whole leftmost label, matches exactly one non-empty label,
+/// and only when at least two labels follow it (`*.example.com`, not `*.com`).
+pub fn dns_matches(pat: List[u8], host: List[u8]) -> bool {
+    let p = lower_all(pat)
+    let mut h = lower_all(host)
+    // a trailing dot on the host is the root label
+    if h.len() > 0 && h[h.len() - 1] == 46 { h = bytes.slice(h, 0, h.len() - 1) }
+    if h.len() == 0 || p.len() == 0 { return false }
+    if p[p.len() - 1] == 46 { return false }
+    let pl = labels(p)
+    let hl = labels(h)
+    for l in hl {
+        if l.len() == 0 { return false }
+    }
+    for l in pl {
+        if l.len() == 0 { return false }
+    }
+    if pl.len() != hl.len() { return false }
+    let mut i: usize = 0
+    while i < pl.len() {
+        let is_star = pl[i].len() == 1 && pl[i][0] == 42
+        if is_star {
+            // wildcard: leftmost label only, and not a public suffix such as *.com
+            if i != 0 || pl.len() < 3 { return false }
+        } else {
+            for c in pl[i] {
+                if c == 42 { return false }
+            }
+            if !bytes.eq(pl[i], hl[i]) { return false }
+        }
+        i += 1
+    }
+    true
+}
+
+/// Is `host` (a DNS name or an IP literal) one of the certificate's names? With a SAN
+/// extension only the SAN counts; a certificate without one matches nothing (the CN is not
+/// consulted: RFC 6125 section 6.4.4, and every current browser).
+pub fn matches_host(c: Cert, host: List[u8]) -> bool {
+    match parse_ip(host) {
+        Some(ip) => {
+            for x in c.ips {
+                if bytes.eq(x, ip) { return true }
+            }
+            false
+        }
+        None => {
+            for p in c.dns {
+                if dns_matches(p, host) { return true }
+            }
+            false
+        }
+    }
+}
+
+// ------------------------------------------------------------------ trust
+
+/// Trust anchors.
+pub type Store = { roots: List[Cert], skipped: usize }
+
+pub fn empty_store() -> Store { Store(List.new(), 0) }
+
+/// Adds the certificate `der` as a trust anchor; a certificate that does not parse is
+/// counted in `skipped`.
+pub fn add_der(inout s: Store, der: List[u8]) {
+    match parse(der) {
+        Ok(c) => s.roots.push(c)
+        Err(_) => { s.skipped += 1 }
+    }
+}
+
+/// A store from PEM text with CERTIFICATE blocks (other blocks are ignored; certificates
+/// that do not parse are skipped and counted).
+pub fn store_from_pem(text: List[u8]) -> Result[Store, String] {
+    let blocks = pem.decode_all(text)?
+    let mut s = empty_store()
+    for b in blocks {
+        if bytes.eq(b.label, "CERTIFICATE".bytes()) { add_der(inout s, b.der) }
+    }
+    Ok(s)
+}
+
+/// The operating system's trust store: the first of the usual bundle files that exists
+/// (Fedora/RHEL, Debian/Ubuntu, Alpine/SUSE, FreeBSD).
+pub fn system_store() -> Result[Store, String] uses fs {
+    let paths = [
+        "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/ssl/cert.pem", "/etc/ssl/ca-bundle.pem", "/usr/local/share/certs/ca-root-nss.crt"
+    ]
+    for p in paths {
+        if fs.exists(p.bytes()) {
+            let text = fs.read(p.bytes())?
+            return store_from_pem(text)
+        }
+    }
+    Err(String.from("x509: no system certificate bundle found"))
+}
+
+// ------------------------------------------------------------------ chain validation
+
+pub type Reason =
+    | EmptyChain
+    | Expired
+    | NotYetValid
+    | UnknownIssuer
+    | BadSignature
+    | NotCa
+    | PathLength
+    | Usage
+    | NameMismatch
+    | Unsupported
+    | TooDeep
+
+pub type Failure = { reason: Reason, detail: String }
+
+pub fn reason_text(r: Reason) -> str {
+    match r {
+        EmptyChain => "no certificate"
+        Expired => "certificate has expired"
+        NotYetValid => "certificate is not yet valid"
+        UnknownIssuer => "unable to find a trusted issuer"
+        BadSignature => "certificate signature does not verify"
+        NotCa => "issuer is not a certificate authority"
+        PathLength => "path length constraint violated"
+        Usage => "certificate not valid for this use"
+        NameMismatch => "certificate is not valid for the host name"
+        Unsupported => "unsupported certificate feature"
+        TooDeep => "certificate chain too long"
+    }
+}
+
+fn fail(r: Reason) -> Failure { Failure(r, String.from(reason_text(r))) }
+
+/// What the chain is for.
+pub type Purpose = | ServerAuth | ClientAuth
+
+pub const MAX_CHAIN: usize = 8
+
+fn in_window(c: Cert, now: i64) -> Option[Failure] {
+    if now < c.not_before { return Some(fail(NotYetValid)) }
+    if now > c.not_after { return Some(fail(Expired)) }
+    None
+}
+
+fn is_anchor(c: Cert, store: Store) -> bool {
+    for r in store.roots {
+        if bytes.eq(r.der, c.der) { return true }
+    }
+    false
+}
+
+// A trust anchor that is a version 1 certificate (no extensions) is a CA by being trusted;
+// an intermediate the peer sent must say so.
+fn can_issue(issuer: Cert, below: usize, anchor: bool) -> Option[Failure] {
+    if anchor && issuer.version == 0 && !issuer.has_bc { return None }
+    if !issuer.has_bc || !issuer.is_ca { return Some(fail(NotCa)) }
+    match issuer.key_usage {
+        Some(ku) => { if (ku & KU_KEY_CERT_SIGN) == 0 { return Some(fail(NotCa)) } }
+        None => {}
+    }
+    match issuer.path_len {
+        Some(n) => { if (n as usize) < below { return Some(fail(PathLength)) } }
+        None => {}
+    }
+    None
+}
+
+// The key identifier check narrows candidates when both sides have one; a mismatch is not
+// the right issuer, whatever the names say.
+fn key_ids_agree(c: Cert, issuer: Cert) -> bool {
+    match c.aki {
+        Some(a) => {
+            match issuer.ski {
+                Some(s) => bytes.eq(a, s)
+                None => true
+            }
+        }
+        None => true
+    }
+}
+
+fn extend(chain: List[Cert], store: Store, cur: Cert, depth: usize, now: i64, used: List[usize]) -> Result[Cert, Failure] {
+    match in_window(cur, now) {
+        Some(f) => return Err(f)
+        None => {}
+    }
+    match cur.problem {
+        Some(p) => return Err(Failure(Unsupported, p))
+        None => {}
+    }
+    if is_anchor(cur, store) { return Ok(cur) }
+    if depth + 1 >= MAX_CHAIN { return Err(fail(TooDeep)) }
+    // candidate issuers: the trust anchors first, then the intermediates the peer sent
+    let mut best = fail(UnknownIssuer)
+    let mut matched = false
+    for r in store.roots {
+        if bytes.eq(r.subject, cur.issuer) && key_ids_agree(cur, r) {
+            match can_issue(r, depth, true) {
+                Some(f) => { best = f }
+                None => {
+                    if !signed_by(cur, r) {
+                        best = fail(BadSignature)
+                    } else {
+                        match extend(chain, store, r, depth + 1, now, used) {
+                            Ok(a) => return Ok(a)
+                            Err(f) => { best = f }
+                        }
+                    }
+                }
+            }
+            matched = true
+        }
+    }
+    let mut i: usize = 1
+    while i < chain.len() {
+        let mut already = false
+        for u in used {
+            if u == i { already = true }
+        }
+        let cand = chain[i].copy()
+        if !already && bytes.eq(cand.subject, cur.issuer) && key_ids_agree(cur, cand) {
+            match can_issue(cand, depth, false) {
+                Some(f) => { best = f }
+                None => {
+                    if !signed_by(cur, cand) {
+                        best = fail(BadSignature)
+                    } else {
+                        let mut u2 = used.copy()
+                        u2.push(i)
+                        match extend(chain, store, cand, depth + 1, now, u2) {
+                            Ok(a) => return Ok(a)
+                            Err(f) => { best = f }
+                        }
+                    }
+                }
+            }
+            matched = true
+        }
+        i += 1
+    }
+    if !matched { return Err(fail(UnknownIssuer)) }
+    Err(best)
+}
+
+/// Validates `chain` (the leaf first, then the certificates the peer sent in any order)
+/// against `store` at Unix time `now`, for `purpose`; for a server certificate, `name` is the
+/// host name or IP literal it must be valid for (`None` skips the name check). Returns the
+/// trust anchor the chain ends at.
+pub fn verify_chain(chain: List[Cert], store: Store, now: i64, purpose: Purpose, name: Option[List[u8]]) -> Result[Cert, Failure] {
+    if chain.len() == 0 { return Err(fail(EmptyChain)) }
+    if chain.len() > MAX_CHAIN { return Err(fail(TooDeep)) }
+    let leaf = chain[0].copy()
+    // the leaf's own constraints
+    match purpose {
+        ServerAuth => {
+            if leaf.eku_present && !leaf.eku_server { return Err(Failure(Usage, String.from("certificate is not for server authentication"))) }
+        }
+        ClientAuth => {
+            if leaf.eku_present && !leaf.eku_client { return Err(Failure(Usage, String.from("certificate is not for client authentication"))) }
+        }
+    }
+    match leaf.key_usage {
+        Some(ku) => {
+            if (ku & KU_DIGITAL_SIGNATURE) == 0 { return Err(Failure(Usage, String.from("keyUsage lacks digitalSignature"))) }
+        }
+        None => {}
+    }
+    let anchor = extend(chain, store, leaf, 0, now, List.new())?
+    match name {
+        Some(h) => {
+            if !matches_host(leaf, h) { return Err(fail(NameMismatch)) }
+        }
+        None => {}
+    }
+    Ok(anchor)
+}

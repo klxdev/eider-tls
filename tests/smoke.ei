@@ -1,0 +1,7 @@
+import std.io
+import std.bytes
+import crypto
+
+fn main() uses io {
+    io.outln(bytes.hex(crypto.sha256("abc".bytes())))
+}

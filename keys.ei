@@ -1,0 +1,109 @@
+//! tls.keys: the TLS 1.3 key schedule (RFC 8446 section 7): HKDF-Expand-Label, Derive-Secret,
+//! the early, handshake and master secrets, traffic keys, Finished and KeyUpdate, and the
+//! handshake transcript hash. Secrets are `crypto.Prk` values (hash and bytes).
+
+import crypto
+import tls.suite
+import tls.wire
+
+/// HKDF-Expand-Label(secret, label, context, length) of RFC 8446 section 7.1: `label` is
+/// given without the "tls13 " prefix.
+pub fn expand_label(secret: crypto.Prk, label: str, context: List[u8], len: usize) -> Result[List[u8], crypto.Error] {
+    let mut full = "tls13 ".bytes()
+    wire.put(inout full, label.bytes())
+    let mut info: List[u8] = List.new()
+    wire.put_u16(inout info, (len & 65535) as u32)
+    wire.put_vec8(inout info, full)
+    wire.put_vec8(inout info, context)
+    crypto.hkdf_expand(secret, info, len)
+}
+
+/// Derive-Secret(secret, label, messages) given the transcript hash of the messages.
+pub fn derive_secret(secret: crypto.Prk, label: str, transcript_hash: List[u8]) -> Result[crypto.Prk, crypto.Error] {
+    let n = crypto.hash_len(secret.hash)
+    let b = expand_label(secret, label, transcript_hash, n)?
+    crypto.prk(secret.hash, b)
+}
+
+/// The Early Secret with no PSK: HKDF-Extract(0, 0^Hash.length).
+pub fn early_secret(h: crypto.Hash) -> Result[crypto.Prk, crypto.Error] {
+    crypto.hkdf_extract(h, List.new(), wire.zeros(crypto.hash_len(h)))
+}
+
+fn empty_hash(h: crypto.Hash) -> Result[List[u8], crypto.Error] { crypto.digest(h, List.new()) }
+
+/// HKDF-Extract(Derive-Secret(early, "derived", ""), ecdhe).
+pub fn handshake_secret(early: crypto.Prk, ecdhe: List[u8]) -> Result[crypto.Prk, crypto.Error] {
+    let d = derive_secret(early, "derived", empty_hash(early.hash)?)?
+    crypto.hkdf_extract(early.hash, d.bytes, ecdhe)
+}
+
+/// HKDF-Extract(Derive-Secret(handshake, "derived", ""), 0^Hash.length).
+pub fn master_secret(hs: crypto.Prk) -> Result[crypto.Prk, crypto.Error] {
+    let d = derive_secret(hs, "derived", empty_hash(hs.hash)?)?
+    crypto.hkdf_extract(hs.hash, d.bytes, wire.zeros(crypto.hash_len(hs.hash)))
+}
+
+/// An AEAD key and the base of its per-record nonces (section 7.3).
+pub type Traffic = { key: crypto.AeadKey, iv: crypto.Nonce }
+
+pub fn traffic(s: suite.Suite, secret: crypto.Prk) -> Result[Traffic, crypto.Error] {
+    let a = suite.aead(s)
+    let k = expand_label(secret, "key", List.new(), crypto.aead_key_len(a))?
+    let iv = expand_label(secret, "iv", List.new(), crypto.NONCE_LEN)?
+    Ok(Traffic(crypto.aead_key(a, k)?, crypto.nonce(iv)?))
+}
+
+/// The traffic secret after a KeyUpdate (section 7.2).
+pub fn next_secret(secret: crypto.Prk) -> Result[crypto.Prk, crypto.Error] {
+    let b = expand_label(secret, "traffic upd", List.new(), crypto.hash_len(secret.hash))?
+    crypto.prk(secret.hash, b)
+}
+
+/// verify_data of a Finished message (section 4.4.4): HMAC(finished_key, transcript hash).
+pub fn finished(base: crypto.Prk, transcript_hash: List[u8]) -> Result[List[u8], crypto.Error] {
+    let fk = expand_label(base, "finished", List.new(), crypto.hash_len(base.hash))?
+    let t = crypto.hmac(crypto.hmac_key(base.hash, fk), transcript_hash)?
+    Ok(t.bytes)
+}
+
+/// The octets a CertificateVerify signs (section 4.4.3): 64 spaces, the context string, a
+/// zero byte and the transcript hash.
+pub fn cert_verify_content(server: bool, transcript_hash: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    let mut i = 0
+    while i < 64 {
+        out.push(32)
+        i += 1
+    }
+    if server {
+        wire.put(inout out, "TLS 1.3, server CertificateVerify".bytes())
+    } else {
+        wire.put(inout out, "TLS 1.3, client CertificateVerify".bytes())
+    }
+    out.push(0)
+    wire.put(inout out, transcript_hash)
+    out
+}
+
+// ------------------------------------------------------------------ the transcript
+
+/// The handshake messages so far (each with its 4-byte header), hashed on demand.
+pub type Transcript = { h: crypto.Hash, data: List[u8] }
+
+pub fn transcript(h: crypto.Hash) -> Transcript { Transcript(h, List.new()) }
+
+pub fn add(inout t: Transcript, msg: List[u8]) { wire.put(inout t.data, msg) }
+
+pub fn hash(t: Transcript) -> Result[List[u8], crypto.Error] { crypto.digest(t.h, t.data) }
+
+/// After a HelloRetryRequest the first ClientHello is replaced by a synthetic message_hash
+/// message (section 4.4.1); the transcript restarts with it, using the suite's hash `h`.
+pub fn restart_for_retry(old: Transcript, h: crypto.Hash) -> Result[Transcript, crypto.Error] {
+    let first = crypto.digest(h, old.data)?
+    let mut msg: List[u8] = List.new()
+    msg.push(254)
+    wire.put_u24(inout msg, (first.len() & 16777215) as u32)
+    wire.put(inout msg, first)
+    Ok(Transcript(h, msg))
+}

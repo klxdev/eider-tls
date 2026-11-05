@@ -1,0 +1,81 @@
+//! tls.pem: PEM (RFC 7468) blocks: `-----BEGIN LABEL-----`, base64 lines, `-----END LABEL-----`.
+//! Text outside the blocks is skipped (trust bundles carry comments); a malformed block is
+//! an error, never skipped, and at most MAX_BLOCKS blocks are read.
+
+import std.bytes
+import std.encoding
+
+/// One block: its label ("CERTIFICATE", "PRIVATE KEY", ...) and decoded contents.
+pub type Block = { label: List[u8], der: List[u8] }
+
+pub const MAX_BLOCKS: usize = 4096
+
+fn begin_marker() -> List[u8] { "-----BEGIN ".bytes() }
+
+fn dashes() -> List[u8] { "-----".bytes() }
+
+/// Every block in `text`; `Err` names the first malformed one.
+pub fn decode_all(text: List[u8]) -> Result[List[Block], String] {
+    let mut out: List[Block] = List.new()
+    let mut at: usize = 0
+    while true {
+        let b = match bytes.find(text, begin_marker(), at) {
+            Some(i) => i
+            None => break
+        }
+        let lab_start = b + 11
+        let lab_end = match bytes.find(text, dashes(), lab_start) {
+            Some(i) => i
+            None => return Err(String.from("pem: unterminated BEGIN line"))
+        }
+        let label = bytes.slice(text, lab_start, lab_end)
+        if label.len() > 64 { return Err(String.from("pem: label too long")) }
+        let body_start = lab_end + 5
+        let mut end_marker = "-----END ".bytes()
+        bytes.append(inout end_marker, label)
+        bytes.append(inout end_marker, dashes())
+        let e = match bytes.find(text, end_marker, body_start) {
+            Some(i) => i
+            None => return Err(String.from("pem: block without END line"))
+        }
+        // the base64 text: ASCII whitespace between lines is allowed, nothing else is
+        let mut b64: List[u8] = List.new()
+        let mut k = body_start.copy()
+        while k < e {
+            let c = text[k]
+            if c == 32 || c == 9 || c == 10 || c == 13 {
+                k += 1
+            } else {
+                b64.push(c)
+                k += 1
+            }
+        }
+        let der = match encoding.unbase64(b64) {
+            Ok(d) => d
+            Err(_) => return Err(String.from("pem: bad base64"))
+        }
+        out.push(Block(label, der))
+        if out.len() > MAX_BLOCKS { return Err(String.from("pem: too many blocks")) }
+        at = e + end_marker.len()
+    }
+    Ok(out)
+}
+
+/// `der` as a PEM block with `label`, lines of 64 characters.
+pub fn encode(label: str, der: List[u8]) -> List[u8] {
+    let b64 = encoding.base64(der).bytes()
+    let mut out = "-----BEGIN ".bytes()
+    bytes.append(inout out, label.bytes())
+    bytes.append(inout out, "-----\n".bytes())
+    let mut k: usize = 0
+    while k < b64.len() {
+        let stop = if k + 64 < b64.len() { k + 64 } else { b64.len() }
+        bytes.append(inout out, bytes.slice(b64, k, stop))
+        out.push(10)
+        k = stop
+    }
+    bytes.append(inout out, "-----END ".bytes())
+    bytes.append(inout out, label.bytes())
+    bytes.append(inout out, "-----\n".bytes())
+    out
+}

@@ -1,0 +1,2 @@
+//! tls: stub
+pub const VERSION: u32 = 1
