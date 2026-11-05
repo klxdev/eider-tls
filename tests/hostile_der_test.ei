@@ -35,7 +35,7 @@ fn yn(b: bool) -> str { if b { "yes" } else { "no" } }
 
 fn der_case(label: str, hexs: str) uses io {
     let b = wire.hex(hexs)
-    var d = asn1.reader(b)
+    let mut d = asn1.reader(b)
     match asn1.next(inout d) {
         Some(t) => print("{label}: element tag {t.tag}, content {t.end - t.start} bytes")
         None => print("{label}: rejected")
@@ -47,7 +47,7 @@ fn time_case(tag: u8, text: str) uses io {
     b.push(tag)
     b.push(text.bytes().len() as u8)
     bytes.append(inout b, text.bytes())
-    var d = asn1.reader(b)
+    let mut d = asn1.reader(b)
     let t = asn1.next(inout d).unwrap()
     match asn1.time(d, t) {
         Some(s) => print("time {text}: {s}")
@@ -57,20 +57,20 @@ fn time_case(tag: u8, text: str) uses io {
 
 fn mutations(name: str) uses io, fs {
     let der = der_of(name)
-    var r = Rng(7)
-    var prefixes_ok = 0
-    var k: usize = 0
+    let mut r = Rng(7)
+    let mut prefixes_ok = 0
+    let mut k: usize = 0
     while k < der.len() {
         if x509.parse(wire.slice(der, 0, k)).is_ok() { prefixes_ok += 1 }
         k += 1
     }
-    var changed_ok = 0
-    var changed = 0
+    let mut changed_ok = 0
+    let mut changed = 0
     let masks: [u8; 3] = [1, 128, 255]
-    var i: usize = 0
+    let mut i: usize = 0
     while i < der.len() {
         for m in masks {
-            var bad = der.copy()
+            let mut bad = der.copy()
             bad[i] = bad[i] ^ m
             changed += 1
             if x509.parse(bad).is_ok() { changed_ok += 1 }
@@ -78,18 +78,18 @@ fn mutations(name: str) uses io, fs {
         i += 1
     }
     // deletions and insertions of one byte at every position
-    var shifted_ok = 0
+    let mut shifted_ok = 0
     i = 0
     while i < der.len() {
-        var del = der.copy()
+        let mut del = der.copy()
         del.remove(i)
         if x509.parse(del).is_ok() { shifted_ok += 1 }
-        var ins = der.copy()
+        let mut ins = der.copy()
         ins.insert(i, below(inout r, 256) as u8)
         if x509.parse(ins).is_ok() { shifted_ok += 1 }
         i += 1
     }
-    var trailing = der.copy()
+    let mut trailing = der.copy()
     trailing.push(0)
     print("{name}: {der.len()} bytes; prefixes parsed {prefixes_ok}; of {changed} one-byte changes {changed_ok} still parse; of {der.len() * 2} insertions/deletions {shifted_ok} parse; trailing byte parses {yn(x509.parse(trailing).is_ok())}")
 }
@@ -141,7 +141,7 @@ fn main() uses io, fs {
     let ints = ["020100", "02020080", "0202007f", "02020001", "0200", "02028000", "0205ffffffffff", "02050100000000", "020500ffffffff"]
     for h in ints {
         let b = wire.hex(h)
-        var d = asn1.reader(b)
+        let mut d = asn1.reader(b)
         let t = asn1.next(inout d).unwrap()
         let u = asn1.small_uint(d, t)
         print("INTEGER {h}: {u}")
@@ -149,7 +149,7 @@ fn main() uses io, fs {
     let bools = ["0101ff", "010100", "010101", "0102ffff", "0100"]
     for h in bools {
         let b = wire.hex(h)
-        var d = asn1.reader(b)
+        let mut d = asn1.reader(b)
         let t = asn1.next(inout d).unwrap()
         let v = asn1.boolean(d, t)
         print("BOOLEAN {h}: {v}")
@@ -158,8 +158,8 @@ fn main() uses io, fs {
     print("== nesting and garbage")
     // 100000 nested SEQUENCEs cannot be written with one-byte lengths, but a chain of
     // 3-byte headers can: the parser is not recursive, so its depth does not matter
-    var deep: List[u8] = List.new()
-    var depth: usize = 0
+    let mut deep: List[u8] = List.new()
+    let mut depth: usize = 0
     while depth < 20000 {
         deep.push(48)
         deep.push(130)
@@ -168,19 +168,19 @@ fn main() uses io, fs {
         depth += 1
     }
     print("20000 nested headers: {yn(x509.parse(deep).is_ok())}")
-    var r = Rng(99)
-    var parsed = 0
-    var n: usize = 0
+    let mut r = Rng(99)
+    let mut parsed = 0
+    let mut n: usize = 0
     while n < 400 {
-        var g: List[u8] = List.new()
-        var j: usize = 0
+        let mut g: List[u8] = List.new()
+        let mut j: usize = 0
         while j < n * 3 {
             g.push(below(inout r, 256) as u8)
             j += 1
         }
         if x509.parse(g).is_ok() { parsed += 1 }
         // a SEQUENCE header in front, so the parser gets further
-        var h = wire.hex("3082")
+        let mut h = wire.hex("3082")
         wire.put_u16(inout h, (g.len() & 65535) as u32)
         bytes.append(inout h, g)
         if x509.parse(h).is_ok() { parsed += 1 }
@@ -197,23 +197,23 @@ fn main() uses io, fs {
     print("text without blocks: {nb}")
     let both = bytes.concat(cert, load("inter.pem"))
     print("two blocks: {pem.decode_all(both).unwrap().len()}")
-    var crlf: List[u8] = List.new()
+    let mut crlf: List[u8] = List.new()
     for c in cert {
         if c == 10 { crlf.push(13) }
         crlf.push(c)
     }
     print("CRLF line ends: {pem.decode_all(crlf).unwrap().len()}")
-    var cut = wire.slice(cert, 0, cert.len() - 30)
+    let mut cut = wire.slice(cert, 0, cert.len() - 30)
     print("no END line: {pem.decode_all(cut).is_ok()}")
-    var badb64 = cert.copy()
+    let mut badb64 = cert.copy()
     badb64[40] = 33
     print("a character outside base64: {pem.decode_all(badb64).is_ok()}")
     let mm = pem.decode_all("-----BEGIN A-----\nAAAA\n-----END B-----\n".bytes()).is_ok()
     print("mismatched END label: {mm}")
     let nd = pem.decode_all("-----BEGIN A\nAAAA\n".bytes()).is_ok()
     print("BEGIN without dashes: {nd}")
-    var many: List[u8] = List.new()
-    var q: usize = 0
+    let mut many: List[u8] = List.new()
+    let mut q: usize = 0
     while q < 5000 {
         bytes.append(inout many, "-----BEGIN X-----\nAAAA\n-----END X-----\n".bytes())
         q += 1
@@ -230,11 +230,11 @@ fn main() uses io, fs {
     print("EC SEC1: {keyfile.from_pem(ec).is_ok()}")
     print("certificate is not a key: {keyfile.from_pem(cert).is_ok()}")
     let edder = pem.decode_all(ed).unwrap()[0].der.copy()
-    var kp: usize = 0
-    var kok = 0
+    let mut kp: usize = 0
+    let mut kok = 0
     while kp < edder.len() {
         if keyfile.from_pkcs8(wire.slice(edder, 0, kp)).is_ok() { kok += 1 }
-        var bad = edder.copy()
+        let mut bad = edder.copy()
         bad[kp] = bad[kp] ^ 255
         if keyfile.from_pkcs8(bad).is_ok() { kok += 1 }
         kp += 1
@@ -245,7 +245,7 @@ fn main() uses io, fs {
     kok = 0
     while kp < ecder.len() {
         if keyfile.from_sec1(wire.slice(ecder, 0, kp)).is_ok() { kok += 1 }
-        var bad = ecder.copy()
+        let mut bad = ecder.copy()
         bad[kp] = bad[kp] ^ 255
         if keyfile.from_sec1(bad).is_ok() { kok += 1 }
         kp += 1

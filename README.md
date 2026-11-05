@@ -37,7 +37,7 @@ A server:
 
 ```eider
 let id = config.identity_from_files("chain.pem", "key.pem").unwrap()   // leaf first; Ed25519 or P-256 key
-var cfg = config.server_config(id)
+let mut cfg = config.server_config(id)
 cfg.alpn.push("http/1.1".bytes())
 let listener = net.listener(net.ipv4(0, 0, 0, 0, 8443), false).unwrap()
 let mut c = tls.accept_on(listener, cfg, time.after_ms(10000)).unwrap()

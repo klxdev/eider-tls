@@ -367,7 +367,7 @@ fn timeouts(ccfg: config.ClientConfig, scfg: config.ServerConfig) uses io, net, 
             let rr = c.ready_to_read()
             print("  ready to read: {rr}")
             let w = c.send_by("ping".bytes(), time.after_ms(5000))
-            var got: List[u8] = List.new()
+            let mut got: List[u8] = List.new()
             while got.len() < 4 {
                 match c.recv_by(10, time.after_ms(5000)) {
                     Ok(x) => { bytes.append(inout got, x) }

@@ -135,10 +135,10 @@ fn feed_client(script: fn(handshake.ClientHello, List[u8]) -> List[u8], ccfg: co
     b.set_nonblocking(true).unwrap()
     let th = spawn(|| -> i32 {
         let mut w = b.copy()
-        var buf: List[u8] = List.new()
-        var got = false
-        var ch_opt: Option[handshake.ClientHello] = None
-        var raw: List[u8] = List.new()
+        let mut buf: List[u8] = List.new()
+        let mut got = false
+        let mut ch_opt: Option[handshake.ClientHello] = None
+        let mut raw: List[u8] = List.new()
         while !got {
             match record.parse(buf, 0, 16384) {
                 record.Record(t, h, body, used) => {
@@ -171,7 +171,7 @@ fn feed_client(script: fn(handshake.ClientHello, List[u8]) -> List[u8], ccfg: co
             None => {}
         }
         let sd = net.shutdown(pair.w, net.SHUT_WRITE)
-        var left: i32 = 100
+        let mut left: i32 = 100
         while left > 0 {
             match w.read_by(4096, time.after_ms(300)) {
                 Ok(x) => {
@@ -206,11 +206,11 @@ fn good_share() -> Option[handshake.KeyShare] { Some(handshake.KeyShare(handshak
 
 // `b` with the first occurrence of the hex string `from` replaced by `to` (same length)
 fn patch(b: List[u8], from: str, to: str) -> List[u8] {
-    var out = b.copy()
+    let mut out = b.copy()
     match bytes.find(b, wire.hex(from), 0) {
         Some(at) => {
             let t = wire.hex(to)
-            var k: usize = 0
+            let mut k: usize = 0
             while k < t.len() {
                 out[at + k] = t[k]
                 k += 1
@@ -244,17 +244,17 @@ fn client_case(name: str, script: fn(handshake.ClientHello, List[u8]) -> List[u8
 
 fn main() uses io, net, threads, clock, fs {
     let id = config.identity_from_pem(rd("edchain.pem"), rd("ed.key")).unwrap()
-    var scfg = config.server_config(id)
+    let mut scfg = config.server_config(id)
     scfg.now = Some(asn1.days_from_civil(2026, 11, 6) * 86400)
-    var ccfg = config.client_config("localhost", x509.store_from_pem(rd("root.pem")).unwrap())
+    let mut ccfg = config.client_config("localhost", x509.store_from_pem(rd("root.pem")).unwrap())
     ccfg.now = scfg.now
 
     print("== a server fed")
     let good = good_client_hello()
     show_server("the good ClientHello then end of stream", good, scfg)
-    var failed = 0
-    var accepted = 0
-    var k: usize = 0
+    let mut failed = 0
+    let mut accepted = 0
+    let mut k: usize = 0
     while k < good.len() {
         match feed_server(wire.slice(good, 0, k), scfg) {
             Ok(_) => { accepted += 1 }
@@ -263,12 +263,12 @@ fn main() uses io, net, threads, clock, fs {
         k += 1
     }
     print("every prefix ({good.len()} of them): {failed} rejected, {accepted} accepted")
-    var r = Rng(1234)
+    let mut r = Rng(1234)
     failed = 0
     accepted = 0
-    var i = 0
+    let mut i = 0
     while i < 400 {
-        var m = mutate(inout r, good)
+        let mut m = mutate(inout r, good)
         if below(inout r, 3) == 0 { m = mutate(inout r, m) }
         match feed_server(m, scfg) {
             Ok(_) => { accepted += 1 }
@@ -281,9 +281,9 @@ fn main() uses io, net, threads, clock, fs {
     accepted = 0
     i = 0
     while i < 150 {
-        var g: List[u8] = List.new()
+        let mut g: List[u8] = List.new()
         let n = below(inout r, 700)
-        var j: usize = 0
+        let mut j: usize = 0
         while j < n {
             g.push(below(inout r, 256) as u8)
             j += 1
@@ -301,9 +301,9 @@ fn main() uses io, net, threads, clock, fs {
     show_server("a record header, a huge length, then silence", wire.hex("1603037fff"), scfg)
     show_server("a record of 16 KiB + 1", wire.hex("1603034001"), scfg)
     // TLS 1.2 only: supported_versions says 1.2
-    var old = good.copy()
-    var pos: usize = 0
-    var found = false
+    let mut old = good.copy()
+    let mut pos: usize = 0
+    let mut found = false
     while pos + 4 < old.len() {
         if !found && old[pos] == 2 && old[pos + 1] == 3 && old[pos + 2] == 4 { old[pos + 2] = 3
             found = true }
@@ -311,21 +311,21 @@ fn main() uses io, net, threads, clock, fs {
     }
     show_server("a ClientHello that offers only TLS 1.2", old, scfg)
     // the same ClientHello in 1-byte records
-    var tiny: List[u8] = List.new()
-    var q: usize = 5
+    let mut tiny: List[u8] = List.new()
+    let mut q: usize = 5
     while q < good.len() {
         bytes.append(inout tiny, record.plain(record.HANDSHAKE, wire.slice(good, q, q + 1)))
         q += 1
     }
     show_server("a ClientHello in 1-byte records, then end of stream", tiny, scfg)
     // a good ClientHello followed by encrypted garbage
-    var junk = good.copy()
+    let mut junk = good.copy()
     bytes.append(inout junk, record.plain(record.APPLICATION_DATA, filled(60, 3)))
     show_server("a ClientHello then a forged protected record", junk, scfg)
-    var junk2 = good.copy()
+    let mut junk2 = good.copy()
     bytes.append(inout junk2, record.plain(record.HANDSHAKE, wire.hex("14000020")))
     show_server("a ClientHello then a plaintext Finished", junk2, scfg)
-    var junk3 = good.copy()
+    let mut junk3 = good.copy()
     bytes.append(inout junk3, alert_record(2, 40))
     show_server("a ClientHello then a fatal alert", junk3, scfg)
     show_server("a record of an unknown type", wire.hex("990303000100"), scfg)
@@ -357,13 +357,13 @@ fn main() uses io, net, threads, clock, fs {
         bytes.concat(sh_record(ch, 4865, good_share(), 772), record.plain(record.APPLICATION_DATA, filled(80, 1)))
     }, ccfg)
     client_case("a ServerHello, then a change_cipher_spec, then a forged record", |ch: handshake.ClientHello, raw: List[u8]| -> List[u8] {
-        var out = sh_record(ch, 4865, good_share(), 772)
+        let mut out = sh_record(ch, 4865, good_share(), 772)
         bytes.append(inout out, wire.hex("140303000101"))
         bytes.append(inout out, record.plain(record.APPLICATION_DATA, filled(40, 1)))
         out
     }, ccfg)
     client_case("a ServerHello, then three change_cipher_spec records", |ch: handshake.ClientHello, raw: List[u8]| -> List[u8] {
-        var out = sh_record(ch, 4865, good_share(), 772)
+        let mut out = sh_record(ch, 4865, good_share(), 772)
         bytes.append(inout out, wire.hex("140303000101140303000101140303000101"))
         out
     }, ccfg)
@@ -394,17 +394,17 @@ fn main() uses io, net, threads, clock, fs {
     }, ccfg)
 
     // damaged ServerHellos
-    var good_sh: List[u8] = List.new()
-    var failed2 = 0
-    var survived = 0
-    var seed = 5
-    var n: usize = 0
+    let mut good_sh: List[u8] = List.new()
+    let mut failed2 = 0
+    let mut survived = 0
+    let mut seed = 5
+    let mut n: usize = 0
     while n < 300 {
         seed += 1
         let s = seed
         match feed_client(|ch: handshake.ClientHello, raw: List[u8]| -> List[u8] {
-            var rr = Rng(s as u64)
-            var m = mutate(inout rr, sh_record(ch, 4865, good_share(), 772))
+            let mut rr = Rng(s as u64)
+            let mut m = mutate(inout rr, sh_record(ch, 4865, good_share(), 772))
             if below(inout rr, 2) == 0 { m = mutate(inout rr, m) }
             m
         }, ccfg) {

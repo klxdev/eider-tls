@@ -37,9 +37,9 @@ fn shout[S: stream.Reader + stream.Writer](inout s: S) -> Result[String, stream.
 fn main() uses io, fs, net, threads, clock {
     let l = net.listener(net.ipv4(127, 0, 0, 1, 0), false).unwrap()
     let addr = net.local_addr(l).unwrap()
-    var scfg = config.server_config(config.identity_from_pem(rd("edchain.pem"), rd("ed.key")).unwrap())
+    let mut scfg = config.server_config(config.identity_from_pem(rd("edchain.pem"), rd("ed.key")).unwrap())
     scfg.now = Some(asn1.days_from_civil(2026, 11, 6) * 86400)
-    var ccfg = config.client_config("localhost", x509.store_from_pem(rd("root.pem")).unwrap())
+    let mut ccfg = config.client_config("localhost", x509.store_from_pem(rd("root.pem")).unwrap())
     ccfg.now = scfg.now
     let th = spawn(|| -> String {
         match tls.accept_on(l, scfg, time.after_ms(10000)) {
