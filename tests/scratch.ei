@@ -1,16 +1,59 @@
 import std.io
 import std.bytes
-import crypto
+import std.fs
+import std.net
+import std.stream
+import std.task
+import std.time
 import tls.alert
-import tls.wire
-import tls.ct
-import tls.suite
-import tls.keys
-import tls.record
-import tls.asn1
-import tls.pem
+import tls.client
+import tls.config
+import tls.conn
+import tls.server
 import tls.x509
+import tls.pem
+import tls.asn1
 
-fn main() uses io {
-    io.outln("ok".bytes())
+fn rd(path: str) -> List[u8] uses fs {
+    fs.read(path.bytes()).unwrap()
+}
+
+fn main() uses io, fs, net, threads, clock {
+    let pair = net.pair(net.STREAM).unwrap()
+    let a = stream.fd(pair.r)
+    let b = stream.fd(pair.w)
+    a.set_nonblocking(true).unwrap()
+    b.set_nonblocking(true).unwrap()
+    let id = config.identity_from_pem(rd("tests/pki/edchain.pem"), rd("tests/pki/ed.key")).unwrap()
+    let scfg = config.server_config(id)
+    let roots = x509.store_from_pem(rd("tests/pki/root.pem")).unwrap()
+    let mut ccfg = config.client_config("localhost", roots)
+    ccfg.now = Some(asn1.days_from_civil(2026, 11, 6) * 86400)
+    let th = spawn(|| -> Result[List[u8], alert.Error] {
+        let mut c = server.accept(b, scfg, time.after_ms(10000))?
+        let got = c.recv_by(100, time.after_ms(10000))?
+        let mut reply = "echo:".bytes()
+        bytes.append(inout reply, got)
+        c.send_by(reply, time.after_ms(10000))?
+        c.close()?
+        Ok(got)
+    })
+    match client.connect(a, ccfg, time.after_ms(10000)) {
+        Ok(c0) => {
+            let mut c = c0.copy()
+            c.send_by("hello".bytes(), time.after_ms(10000)).unwrap()
+            let r = c.recv_by(100, time.after_ms(10000))
+            match r {
+                Ok(b) => io.outln(b)
+                Err(e) => print("client read: {e}")
+            }
+            let eof = c.recv_by(100, time.after_ms(10000))
+            print("eof: {eof}")
+        }
+        Err(e) => print("client: {e}")
+    }
+    match th.join() {
+        Ok(g) => io.outln(g)
+        Err(e) => print("server: {e}")
+    }
 }

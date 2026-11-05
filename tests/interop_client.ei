@@ -1,0 +1,147 @@
+// An Eider TLS client for tests/interop.sh: connects to 127.0.0.1:<port>, sends an HTTP/1.0
+// request and prints the connection's properties and the response.
+//
+//   interop_client <port> <ca.pem> <server-name> [options]
+//
+// options: alpn=<proto>[,<proto>] suites=<aes128|aes256|chacha> groups=<x25519|p256|both>
+//          share=<x25519|p256> cert=<chain.pem>:<key.pem> insecure=1
+
+import std.bytes
+import std.env
+import std.fs
+import std.io
+import std.net
+import std.stream
+import std.strings
+import std.time
+import tls.alert
+import tls.client
+import tls.config
+import tls.conn
+import tls.handshake
+import tls.suite
+import tls.x509
+
+fn arg(i: usize) -> String {
+    let a = env.args()
+    if i < a.len() { return String.from_utf8(a[i].copy()) }
+    String.from("")
+}
+
+fn opt(name: str) -> Option[String] uses io {
+    let a = env.args()
+    let mut prefix = String.from(name)
+    prefix.push_str("=")
+    let mut i: usize = 4
+    while i < a.len() {
+        let s = String.from_utf8(a[i].copy())
+        if strings.starts_with(s, prefix) {
+            return strings.strip_prefix(s, prefix)
+        }
+        i += 1
+    }
+    None
+}
+
+fn die(m: String) uses io {
+    io.errln(m.bytes())
+    env.exit(1)
+}
+
+fn main() uses io, fs, net, clock {
+    let port = strings.parse_i64(arg(1)).unwrap() as i32
+    let ca = fs.read(arg(2).bytes()).unwrap()
+    let mut name = arg(3)
+    let mut cfg = config.client_config("localhost", x509.store_from_pem(ca).unwrap())
+    cfg.server_name = Some(name.bytes())
+    match opt("alpn") {
+        Some(a) => {
+            cfg.alpn = List.new()
+            for p in strings.split(a, ",") { cfg.alpn.push(p.bytes()) }
+        }
+        None => {}
+    }
+    match opt("suites") {
+        Some(s) => {
+            cfg.suites = List.new()
+            if s == String.from("aes128") { cfg.suites.push(suite.Aes128GcmSha256) }
+            if s == String.from("aes256") { cfg.suites.push(suite.Aes256GcmSha384) }
+            if s == String.from("chacha") { cfg.suites.push(suite.ChaCha20Poly1305Sha256) }
+        }
+        None => {}
+    }
+    match opt("groups") {
+        Some(g) => {
+            cfg.groups = List.new()
+            if g == String.from("x25519") || g == String.from("both") { cfg.groups.push(handshake.GROUP_X25519) }
+            if g == String.from("p256") || g == String.from("both") { cfg.groups.push(handshake.GROUP_SECP256R1) }
+            cfg.share_groups = List.new()
+            cfg.share_groups.push(cfg.groups[0])
+        }
+        None => {}
+    }
+    match opt("share") {
+        Some(g) => {
+            cfg.share_groups = List.new()
+            if g == String.from("x25519") { cfg.share_groups.push(handshake.GROUP_X25519) }
+            if g == String.from("p256") { cfg.share_groups.push(handshake.GROUP_SECP256R1) }
+        }
+        None => {}
+    }
+    match opt("cert") {
+        Some(cp) => {
+            let parts = strings.split(cp, ":")
+            cfg.identity = Some(config.identity_from_files(parts[0].text(), parts[1].text()).unwrap())
+        }
+        None => {}
+    }
+    match opt("insecure") {
+        Some(_) => { cfg.verify = config.Insecure }
+        None => {}
+    }
+    let sock = match stream.connect_by(net.ipv4(127, 0, 0, 1, port), time.after_ms(5000)) {
+        Ok(s) => s
+        Err(e) => {
+            die("connect: {e}")
+            return
+        }
+    }
+    let mut c = match client.connect(sock, cfg, time.after_ms(10000)) {
+        Ok(c) => c
+        Err(e) => {
+            io.outln("handshake failed: {e}".bytes())
+            env.exit(2)
+            return
+        }
+    }
+    let cs = suite.name(c.cipher_suite())
+    io.outln("connected {cs}".bytes())
+    match c.negotiated_alpn() {
+        Some(p) => io.outln("alpn {String.from_utf8(p)}".bytes())
+        None => io.outln("alpn none".bytes())
+    }
+    let req = "GET / HTTP/1.0\r\n\r\n"
+    match c.send_by(req.bytes(), time.after_ms(5000)) {
+        Ok(_) => {}
+        Err(e) => {
+            io.outln("write failed: {e}".bytes())
+            env.exit(3)
+        }
+    }
+    let mut got: List[u8] = List.new()
+    while true {
+        match c.recv_by(16384, time.after_ms(5000)) {
+            Ok(b) => {
+                if b.len() == 0 { break }
+                bytes.append(inout got, b)
+            }
+            Err(e) => {
+                io.outln("read failed: {e}".bytes())
+                env.exit(4)
+            }
+        }
+    }
+    io.outln("received {got.len()} bytes, clean close".bytes())
+    io.out(got)
+    let r = c.close()
+}

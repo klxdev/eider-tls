@@ -1,0 +1,129 @@
+//! tls.kex: key exchange groups (X25519 and secp256r1) and the handshake signature schemes
+//! (ed25519 and ecdsa_secp256r1_sha256) over the crypto package. RSA signatures are not
+//! implemented: the crypto package has no RSA.
+
+import crypto
+import tls.handshake
+import tls.keyfile
+import tls.x509
+
+/// An ephemeral key and its public share.
+pub type Kex =
+    | X25519Kex(sec: crypto.X25519Secret, share: List[u8])
+    | P256Kex(sec: crypto.P256Secret, share: List[u8])
+
+pub fn supported(group: u32) -> bool {
+    group == handshake.GROUP_X25519 || group == handshake.GROUP_SECP256R1
+}
+
+pub fn group_of(k: Kex) -> u32 {
+    match k {
+        X25519Kex(_, _) => handshake.GROUP_X25519
+        P256Kex(_, _) => handshake.GROUP_SECP256R1
+    }
+}
+
+pub fn share_of(k: Kex) -> List[u8] {
+    match k {
+        X25519Kex(_, s) => s
+        P256Kex(_, s) => s
+    }
+}
+
+/// A fresh key for `group`.
+pub fn generate(group: u32) -> Result[Kex, crypto.Error] uses io {
+    if group == handshake.GROUP_X25519 {
+        let sk = crypto.x25519_generate()?
+        let pk = crypto.x25519_public(sk)?
+        return Ok(X25519Kex(sk, pk.bytes))
+    }
+    if group == handshake.GROUP_SECP256R1 {
+        let sk = crypto.p256_generate()?
+        let pk = crypto.p256_public(sk)?
+        return Ok(P256Kex(sk, pk.bytes))
+    }
+    Err(crypto.Unsupported)
+}
+
+/// Is `data` a well-formed share for `group` (the right length; for P-256 an uncompressed
+/// point)? Whether a P-256 point is on the curve is checked when it is used.
+pub fn valid_share(group: u32, data: List[u8]) -> bool {
+    if group == handshake.GROUP_X25519 { return data.len() == 32 }
+    if group == handshake.GROUP_SECP256R1 { return data.len() == 65 && data[0] == 4 }
+    false
+}
+
+/// The shared secret with the peer's share: Err for an invalid share (an all-zero X25519
+/// result, a point not on the curve).
+pub fn agree(k: Kex, peer: List[u8]) -> Result[List[u8], crypto.Error] {
+    match k {
+        X25519Kex(sec, _) => {
+            let p = crypto.x25519_public_key(peer)?
+            let s = crypto.x25519_agree(sec, p)?
+            Ok(s.bytes)
+        }
+        P256Kex(sec, _) => {
+            let p = crypto.p256_public_key(peer)?
+            let s = crypto.p256_agree(sec, p)?
+            Ok(s.bytes)
+        }
+    }
+}
+
+// ------------------------------------------------------------------ signatures
+
+/// The signature scheme code for a private key.
+pub fn scheme_of(key: keyfile.SigningKey) -> u32 {
+    match key {
+        keyfile.EdKey(_) => handshake.SIG_ED25519
+        keyfile.EcKey(_) => handshake.SIG_ECDSA_SECP256R1_SHA256
+    }
+}
+
+/// Signs `content` (Ed25519 over the bytes themselves; ECDSA with SHA-256).
+pub fn sign(key: keyfile.SigningKey, content: List[u8]) -> Result[List[u8], crypto.Error] uses io {
+    match key {
+        keyfile.EdKey(seed) => {
+            let s = crypto.ed25519_sign(seed, content)?
+            Ok(s.bytes)
+        }
+        keyfile.EcKey(sec) => {
+            let s = crypto.p256_sign(sec, content)?
+            Ok(s.der)
+        }
+    }
+}
+
+/// Does `sig` verify over `content` under the certificate's key, with scheme `alg`? The
+/// scheme must match the key's type.
+pub fn verify(cert: x509.Cert, alg: u32, content: List[u8], sig: List[u8]) -> bool {
+    if alg == handshake.SIG_ED25519 {
+        match cert.key_kind {
+            x509.Ed25519Key => {
+                let pk = match crypto.ed25519_public_key(cert.key) {
+                    Ok(k) => k
+                    Err(_) => return false
+                }
+                let sg = match crypto.ed25519_signature(sig) {
+                    Ok(s) => s
+                    Err(_) => return false
+                }
+                return crypto.ed25519_verify(pk, content, sg)
+            }
+            _ => return false
+        }
+    }
+    if alg == handshake.SIG_ECDSA_SECP256R1_SHA256 {
+        match cert.key_kind {
+            x509.P256Key => {
+                let pk = match crypto.p256_public_key(cert.key) {
+                    Ok(k) => k
+                    Err(_) => return false
+                }
+                return crypto.p256_verify(pk, content, crypto.p256_signature_der(sig))
+            }
+            _ => return false
+        }
+    }
+    false
+}

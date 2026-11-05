@@ -1,0 +1,616 @@
+//! tls.handshake: TLS 1.3 handshake messages (RFC 8446 section 4): framing a stream of
+//! messages out of handshake record bytes, parsing every message a client or server of this
+//! package receives, and serializing the ones it sends. Every parser works on a bounded
+//! reader (tls.wire), rejects trailing bytes, duplicate extensions and lengths that do not
+//! add up, and returns `None` instead of failing: no input can make it panic.
+
+import tls.wire
+
+pub const CLIENT_HELLO: u8 = 1
+pub const SERVER_HELLO: u8 = 2
+pub const NEW_SESSION_TICKET: u8 = 4
+pub const END_OF_EARLY_DATA: u8 = 5
+pub const ENCRYPTED_EXTENSIONS: u8 = 8
+pub const CERTIFICATE: u8 = 11
+pub const CERTIFICATE_REQUEST: u8 = 13
+pub const CERTIFICATE_VERIFY: u8 = 15
+pub const FINISHED: u8 = 20
+pub const KEY_UPDATE: u8 = 24
+pub const MESSAGE_HASH: u8 = 254
+
+pub const EXT_SERVER_NAME: u32 = 0
+pub const EXT_SUPPORTED_GROUPS: u32 = 10
+pub const EXT_SIGNATURE_ALGORITHMS: u32 = 13
+pub const EXT_ALPN: u32 = 16
+pub const EXT_SUPPORTED_VERSIONS: u32 = 43
+pub const EXT_COOKIE: u32 = 44
+pub const EXT_PSK_KEY_EXCHANGE_MODES: u32 = 45
+pub const EXT_KEY_SHARE: u32 = 51
+pub const EXT_PRE_SHARED_KEY: u32 = 41
+pub const EXT_EARLY_DATA: u32 = 42
+
+pub const GROUP_SECP256R1: u32 = 23
+pub const GROUP_X25519: u32 = 29
+
+pub const SIG_ECDSA_SECP256R1_SHA256: u32 = 1027
+pub const SIG_ED25519: u32 = 2055
+
+pub const TLS13: u32 = 772
+pub const LEGACY_VERSION: u32 = 771
+
+/// The most a single handshake message may carry (RFC 8446 allows 2^24 - 1; a certificate
+/// chain is the biggest and 128 KiB is ample).
+pub const MAX_MESSAGE: usize = 131072
+
+/// The `random` of a HelloRetryRequest: SHA-256("HelloRetryRequest") (section 4.1.3).
+pub fn hrr_random() -> List[u8] {
+    wire.hex("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+}
+
+// ------------------------------------------------------------------ framing
+
+/// What the front of a handshake byte buffer holds.
+pub type Framed =
+    | Need
+    | Message(typ: u8, body: List[u8], raw: List[u8])
+    | Oversize
+
+/// The first complete message in `buf` (`raw` includes the 4-byte header, as the transcript
+/// hashes it), or `Need` for more bytes.
+pub fn frame(buf: List[u8]) -> Framed {
+    if buf.len() < 4 { return Need }
+    let len = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | (buf[3] as usize)
+    if len > MAX_MESSAGE { return Oversize }
+    if buf.len() < 4 + len { return Need }
+    Message(buf[0], wire.slice(buf, 4, 4 + len), wire.slice(buf, 0, 4 + len))
+}
+
+/// A handshake message: type, 24-bit length, body.
+pub fn message(typ: u8, body: List[u8]) -> List[u8] {
+    let mut out: List[u8] = List.new()
+    out.push(typ)
+    wire.put_vec24(inout out, body)
+    out
+}
+
+// ------------------------------------------------------------------ extensions
+
+pub type Extension = { typ: u32, data: List[u8] }
+
+/// Splits an `extensions<0..2^16-1>` block into (type, data), rejecting duplicates.
+fn read_extensions(inout r: wire.Rd) -> Option[List[Extension]] {
+    let mut block = wire.vec16(inout r)?
+    let mut out: List[Extension] = List.new()
+    let mut seen: List[u32] = List.new()
+    while !wire.done(block) {
+        let t = wire.get_u16(inout block)?
+        let mut d = wire.vec16(inout block)?
+        for s in seen {
+            if s == t { return None }
+        }
+        seen.push(t)
+        out.push(Extension(t, wire.rest(inout d)))
+        if out.len() > 64 { return None }
+    }
+    Some(out)
+}
+
+fn put_extension(inout o: List[u8], typ: u32, data: List[u8]) {
+    wire.put_u16(inout o, typ)
+    wire.put_vec16(inout o, data)
+}
+
+fn find_ext(exts: List[Extension], typ: u32) -> Option[List[u8]] {
+    for e in exts {
+        if e.typ == typ { return Some(e.data.copy()) }
+    }
+    None
+}
+
+/// A list of 16-bit values in a vec16 (supported_groups, signature_algorithms).
+fn u16_list(data: List[u8]) -> Option[List[u32]] {
+    let mut r = wire.rd(data)
+    let mut v = wire.vec16(inout r)?
+    if !wire.done(r) { return None }
+    if wire.left(v) % 2 != 0 || wire.left(v) == 0 { return None }
+    let mut out: List[u32] = List.new()
+    while !wire.done(v) {
+        out.push(wire.get_u16(inout v)?)
+        if out.len() > 128 { return None }
+    }
+    Some(out)
+}
+
+fn put_u16_list(inout o: List[u8], xs: List[u32]) {
+    let mut b: List[u8] = List.new()
+    for x in xs { wire.put_u16(inout b, x) }
+    wire.put_vec16(inout o, b)
+}
+
+// ------------------------------------------------------------------ ClientHello
+
+pub type KeyShare = { group: u32, data: List[u8] }
+
+pub type ClientHello = {
+    random: List[u8],
+    session_id: List[u8],
+    suites: List[u32],
+    sni: Option[List[u8]],
+    groups: List[u32],
+    sigalgs: List[u32],
+    alpn: List[List[u8]],
+    versions: List[u32],
+    shares: List[KeyShare],
+    cookie: Option[List[u8]],
+    has_psk: bool,
+    has_early_data: bool
+}
+
+fn parse_sni(data: List[u8]) -> Option[List[u8]] {
+    let mut r = wire.rd(data)
+    let mut list = wire.vec16(inout r)?
+    if !wire.done(r) { return None }
+    let mut host: Option[List[u8]] = None
+    while !wire.done(list) {
+        let ty = wire.get_u8(inout list)?
+        let mut n = wire.vec16(inout list)?
+        let name = wire.rest(inout n)
+        if ty == 0 {
+            // one host_name entry at most
+            if host.is_some() { return None }
+            if name.len() == 0 { return None }
+            for c in name {
+                if c <= 32 || c >= 127 { return None }
+            }
+            host = Some(name)
+        }
+    }
+    host
+}
+
+fn parse_alpn_list(data: List[u8]) -> Option[List[List[u8]]] {
+    let mut r = wire.rd(data)
+    let mut list = wire.vec16(inout r)?
+    if !wire.done(r) { return None }
+    let mut out: List[List[u8]] = List.new()
+    while !wire.done(list) {
+        let mut n = wire.vec8(inout list)?
+        let name = wire.rest(inout n)
+        if name.len() == 0 { return None }
+        out.push(name)
+        if out.len() > 32 { return None }
+    }
+    if out.len() == 0 { return None }
+    Some(out)
+}
+
+fn parse_key_shares(data: List[u8]) -> Option[List[KeyShare]] {
+    let mut r = wire.rd(data)
+    let mut list = wire.vec16(inout r)?
+    if !wire.done(r) { return None }
+    let mut out: List[KeyShare] = List.new()
+    while !wire.done(list) {
+        let g = wire.get_u16(inout list)?
+        let mut k = wire.vec16(inout list)?
+        for s in out {
+            if s.group == g { return None }
+        }
+        out.push(KeyShare(g, wire.rest(inout k)))
+        if out.len() > 16 { return None }
+    }
+    Some(out)
+}
+
+pub fn parse_client_hello(body: List[u8]) -> Option[ClientHello] {
+    let mut r = wire.rd(body)
+    let ver = wire.get_u16(inout r)?
+    if ver != LEGACY_VERSION && ver != 769 && ver != 770 { return None }
+    let random = wire.get_bytes(inout r, 32)?
+    let mut sid = wire.vec8(inout r)?
+    let session_id = wire.rest(inout sid)
+    if session_id.len() > 32 { return None }
+    let mut suites_r = wire.vec16(inout r)?
+    if wire.left(suites_r) % 2 != 0 || wire.left(suites_r) < 2 { return None }
+    let mut suites: List[u32] = List.new()
+    while !wire.done(suites_r) {
+        suites.push(wire.get_u16(inout suites_r)?)
+        if suites.len() > 512 { return None }
+    }
+    // compression_methods: exactly the null method
+    let mut comp = wire.vec8(inout r)?
+    if wire.left(comp) != 1 || wire.get_u8(inout comp)? != 0 { return None }
+    let exts = read_extensions(inout r)?
+    if !wire.done(r) { return None }
+    let mut ch = ClientHello(random, session_id, suites, None, List.new(), List.new(), List.new(), List.new(), List.new(), None, false, false)
+    match find_ext(exts, EXT_SERVER_NAME) {
+        Some(d) => { ch.sni = Some(parse_sni(d)?) }
+        None => {}
+    }
+    match find_ext(exts, EXT_SUPPORTED_GROUPS) {
+        Some(d) => { ch.groups = u16_list(d)? }
+        None => {}
+    }
+    match find_ext(exts, EXT_SIGNATURE_ALGORITHMS) {
+        Some(d) => { ch.sigalgs = u16_list(d)? }
+        None => {}
+    }
+    match find_ext(exts, EXT_ALPN) {
+        Some(d) => { ch.alpn = parse_alpn_list(d)? }
+        None => {}
+    }
+    match find_ext(exts, EXT_SUPPORTED_VERSIONS) {
+        Some(d) => {
+            let mut vr = wire.rd(d)
+            let mut vl = wire.vec8(inout vr)?
+            if !wire.done(vr) || wire.left(vl) % 2 != 0 || wire.left(vl) == 0 { return None }
+            while !wire.done(vl) { ch.versions.push(wire.get_u16(inout vl)?) }
+        }
+        None => {}
+    }
+    match find_ext(exts, EXT_KEY_SHARE) {
+        Some(d) => { ch.shares = parse_key_shares(d)? }
+        None => {}
+    }
+    match find_ext(exts, EXT_COOKIE) {
+        Some(d) => {
+            let mut cr = wire.rd(d)
+            let mut c = wire.vec16(inout cr)?
+            if !wire.done(cr) { return None }
+            let cookie = wire.rest(inout c)
+            if cookie.len() == 0 { return None }
+            ch.cookie = Some(cookie)
+        }
+        None => {}
+    }
+    ch.has_psk = find_ext(exts, EXT_PRE_SHARED_KEY).is_some()
+    ch.has_early_data = find_ext(exts, EXT_EARLY_DATA).is_some()
+    Some(ch)
+}
+
+pub fn client_hello(ch: ClientHello) -> List[u8] {
+    let mut b: List[u8] = List.new()
+    wire.put_u16(inout b, LEGACY_VERSION)
+    wire.put(inout b, ch.random)
+    wire.put_vec8(inout b, ch.session_id)
+    let mut suites: List[u8] = List.new()
+    for s in ch.suites { wire.put_u16(inout suites, s) }
+    wire.put_vec16(inout b, suites)
+    b.push(1)
+    b.push(0)
+    let mut e: List[u8] = List.new()
+    match ch.sni {
+        Some(h) => {
+            let mut entry: List[u8] = List.new()
+            entry.push(0)
+            wire.put_vec16(inout entry, h)
+            let mut list: List[u8] = List.new()
+            wire.put_vec16(inout list, entry)
+            put_extension(inout e, EXT_SERVER_NAME, list)
+        }
+        None => {}
+    }
+    let mut g: List[u8] = List.new()
+    put_u16_list(inout g, ch.groups)
+    put_extension(inout e, EXT_SUPPORTED_GROUPS, g)
+    let mut sa: List[u8] = List.new()
+    put_u16_list(inout sa, ch.sigalgs)
+    put_extension(inout e, EXT_SIGNATURE_ALGORITHMS, sa)
+    if ch.alpn.len() > 0 {
+        let mut names: List[u8] = List.new()
+        for n in ch.alpn { wire.put_vec8(inout names, n) }
+        let mut list: List[u8] = List.new()
+        wire.put_vec16(inout list, names)
+        put_extension(inout e, EXT_ALPN, list)
+    }
+    let mut v: List[u8] = List.new()
+    v.push(2)
+    wire.put_u16(inout v, TLS13)
+    put_extension(inout e, EXT_SUPPORTED_VERSIONS, v)
+    let mut ks: List[u8] = List.new()
+    for s in ch.shares {
+        wire.put_u16(inout ks, s.group)
+        wire.put_vec16(inout ks, s.data)
+    }
+    let mut ksl: List[u8] = List.new()
+    wire.put_vec16(inout ksl, ks)
+    put_extension(inout e, EXT_KEY_SHARE, ksl)
+    match ch.cookie {
+        Some(c) => {
+            let mut cl: List[u8] = List.new()
+            wire.put_vec16(inout cl, c)
+            put_extension(inout e, EXT_COOKIE, cl)
+        }
+        None => {}
+    }
+    wire.put_vec16(inout b, e)
+    message(CLIENT_HELLO, b)
+}
+
+// ------------------------------------------------------------------ ServerHello
+
+pub type ServerHello = {
+    random: List[u8],
+    session_id: List[u8],
+    suite: u32,
+    version: u32,
+    share: Option[KeyShare],
+    selected_group: Option[u32],
+    cookie: Option[List[u8]],
+    retry: bool
+}
+
+pub fn parse_server_hello(body: List[u8]) -> Option[ServerHello] {
+    let mut r = wire.rd(body)
+    if wire.get_u16(inout r)? != LEGACY_VERSION { return None }
+    let random = wire.get_bytes(inout r, 32)?
+    let mut sid = wire.vec8(inout r)?
+    let session_id = wire.rest(inout sid)
+    if session_id.len() > 32 { return None }
+    let suite = wire.get_u16(inout r)?
+    if wire.get_u8(inout r)? != 0 { return None }
+    let exts = read_extensions(inout r)?
+    if !wire.done(r) { return None }
+    let retry = bytes_eq(random, hrr_random())
+    let mut sh = ServerHello(random, session_id, suite, 0, None, None, None, retry)
+    match find_ext(exts, EXT_SUPPORTED_VERSIONS) {
+        Some(d) => {
+            let mut vr = wire.rd(d)
+            sh.version = wire.get_u16(inout vr)?
+            if !wire.done(vr) { return None }
+        }
+        None => {}
+    }
+    match find_ext(exts, EXT_KEY_SHARE) {
+        Some(d) => {
+            let mut kr = wire.rd(d)
+            let g = wire.get_u16(inout kr)?
+            if retry {
+                if !wire.done(kr) { return None }
+                sh.selected_group = Some(g)
+            } else {
+                let mut k = wire.vec16(inout kr)?
+                if !wire.done(kr) { return None }
+                sh.share = Some(KeyShare(g, wire.rest(inout k)))
+            }
+        }
+        None => {}
+    }
+    match find_ext(exts, EXT_COOKIE) {
+        Some(d) => {
+            let mut cr = wire.rd(d)
+            let mut c = wire.vec16(inout cr)?
+            if !wire.done(cr) { return None }
+            sh.cookie = Some(wire.rest(inout c))
+        }
+        None => {}
+    }
+    // a ServerHello with a pre_shared_key (resumption) is not one this package asked for
+    for e in exts {
+        if e.typ == EXT_PRE_SHARED_KEY { sh.version = 0 }
+    }
+    Some(sh)
+}
+
+fn bytes_eq(a: List[u8], b: List[u8]) -> bool {
+    if a.len() != b.len() { return false }
+    let mut i: usize = 0
+    while i < a.len() {
+        if a[i] != b[i] { return false }
+        i += 1
+    }
+    true
+}
+
+/// A ServerHello, or with `retry` a HelloRetryRequest (then `share` is ignored and
+/// `selected_group` names the group the client must send a share for).
+pub fn server_hello(sh: ServerHello) -> List[u8] {
+    let mut b: List[u8] = List.new()
+    wire.put_u16(inout b, LEGACY_VERSION)
+    if sh.retry {
+        wire.put(inout b, hrr_random())
+    } else {
+        wire.put(inout b, sh.random)
+    }
+    wire.put_vec8(inout b, sh.session_id)
+    wire.put_u16(inout b, sh.suite)
+    b.push(0)
+    let mut e: List[u8] = List.new()
+    let mut v: List[u8] = List.new()
+    wire.put_u16(inout v, TLS13)
+    put_extension(inout e, EXT_SUPPORTED_VERSIONS, v)
+    if sh.retry {
+        match sh.selected_group {
+            Some(g) => {
+                let mut k: List[u8] = List.new()
+                wire.put_u16(inout k, g)
+                put_extension(inout e, EXT_KEY_SHARE, k)
+            }
+            None => {}
+        }
+        match sh.cookie {
+            Some(c) => {
+                let mut cl: List[u8] = List.new()
+                wire.put_vec16(inout cl, c)
+                put_extension(inout e, EXT_COOKIE, cl)
+            }
+            None => {}
+        }
+    } else {
+        match sh.share {
+            Some(s) => {
+                let mut k: List[u8] = List.new()
+                wire.put_u16(inout k, s.group)
+                wire.put_vec16(inout k, s.data)
+                put_extension(inout e, EXT_KEY_SHARE, k)
+            }
+            None => {}
+        }
+    }
+    wire.put_vec16(inout b, e)
+    message(SERVER_HELLO, b)
+}
+
+// ------------------------------------------------------------------ EncryptedExtensions
+
+pub type EncryptedExtensions = { alpn: Option[List[u8]], sni_ack: bool, unexpected: List[u32] }
+
+/// `unexpected` lists the extension types other than server_name, supported_groups and ALPN,
+/// which a client that did not offer them must refuse.
+pub fn parse_encrypted_extensions(body: List[u8]) -> Option[EncryptedExtensions] {
+    let mut r = wire.rd(body)
+    let exts = read_extensions(inout r)?
+    if !wire.done(r) { return None }
+    let mut ee = EncryptedExtensions(None, false, List.new())
+    for e in exts {
+        if e.typ == EXT_ALPN {
+            let names = parse_alpn_list(e.data)?
+            if names.len() != 1 { return None }
+            ee.alpn = Some(names[0].copy())
+        } else if e.typ == EXT_SERVER_NAME {
+            if e.data.len() != 0 { return None }
+            ee.sni_ack = true
+        } else if e.typ == EXT_SUPPORTED_GROUPS {
+            // allowed, and ignored
+        } else {
+            ee.unexpected.push(e.typ)
+        }
+    }
+    Some(ee)
+}
+
+pub fn encrypted_extensions(alpn: Option[List[u8]], sni_ack: bool) -> List[u8] {
+    let mut e: List[u8] = List.new()
+    if sni_ack { put_extension(inout e, EXT_SERVER_NAME, List.new()) }
+    match alpn {
+        Some(p) => {
+            let mut names: List[u8] = List.new()
+            wire.put_vec8(inout names, p)
+            let mut list: List[u8] = List.new()
+            wire.put_vec16(inout list, names)
+            put_extension(inout e, EXT_ALPN, list)
+        }
+        None => {}
+    }
+    let mut b: List[u8] = List.new()
+    wire.put_vec16(inout b, e)
+    message(ENCRYPTED_EXTENSIONS, b)
+}
+
+// ------------------------------------------------------------------ Certificate and friends
+
+pub const MAX_CERTS: usize = 16
+
+pub type CertificateMsg = { context: List[u8], certs: List[List[u8]] }
+
+pub fn parse_certificate(body: List[u8]) -> Option[CertificateMsg] {
+    let mut r = wire.rd(body)
+    let mut ctx = wire.vec8(inout r)?
+    let context = wire.rest(inout ctx)
+    let mut list = wire.vec24(inout r)?
+    if !wire.done(r) { return None }
+    let mut certs: List[List[u8]] = List.new()
+    while !wire.done(list) {
+        let mut c = wire.vec24(inout list)?
+        let der = wire.rest(inout c)
+        if der.len() == 0 { return None }
+        // per-certificate extensions (status_request, SCT): framed, otherwise ignored
+        let _ext = read_extensions(inout list)?
+        certs.push(der)
+        if certs.len() > MAX_CERTS { return None }
+    }
+    Some(CertificateMsg(context, certs))
+}
+
+pub fn certificate(context: List[u8], certs: List[List[u8]]) -> List[u8] {
+    let mut list: List[u8] = List.new()
+    for c in certs {
+        wire.put_vec24(inout list, c)
+        wire.put_u16(inout list, 0)
+    }
+    let mut b: List[u8] = List.new()
+    wire.put_vec8(inout b, context)
+    wire.put_vec24(inout b, list)
+    message(CERTIFICATE, b)
+}
+
+pub type CertificateVerifyMsg = { alg: u32, sig: List[u8] }
+
+pub fn parse_certificate_verify(body: List[u8]) -> Option[CertificateVerifyMsg] {
+    let mut r = wire.rd(body)
+    let alg = wire.get_u16(inout r)?
+    let mut s = wire.vec16(inout r)?
+    if !wire.done(r) { return None }
+    Some(CertificateVerifyMsg(alg, wire.rest(inout s)))
+}
+
+pub fn certificate_verify(alg: u32, sig: List[u8]) -> List[u8] {
+    let mut b: List[u8] = List.new()
+    wire.put_u16(inout b, alg)
+    wire.put_vec16(inout b, sig)
+    message(CERTIFICATE_VERIFY, b)
+}
+
+pub type CertificateRequestMsg = { context: List[u8], sigalgs: List[u32] }
+
+pub fn parse_certificate_request(body: List[u8]) -> Option[CertificateRequestMsg] {
+    let mut r = wire.rd(body)
+    let mut ctx = wire.vec8(inout r)?
+    let context = wire.rest(inout ctx)
+    let exts = read_extensions(inout r)?
+    if !wire.done(r) { return None }
+    let sa = find_ext(exts, EXT_SIGNATURE_ALGORITHMS)?
+    Some(CertificateRequestMsg(context, u16_list(sa)?))
+}
+
+pub fn certificate_request(context: List[u8], sigalgs: List[u32]) -> List[u8] {
+    let mut sa: List[u8] = List.new()
+    put_u16_list(inout sa, sigalgs)
+    let mut e: List[u8] = List.new()
+    put_extension(inout e, EXT_SIGNATURE_ALGORITHMS, sa)
+    let mut b: List[u8] = List.new()
+    wire.put_vec8(inout b, context)
+    wire.put_vec16(inout b, e)
+    message(CERTIFICATE_REQUEST, b)
+}
+
+pub fn finished(verify_data: List[u8]) -> List[u8] { message(FINISHED, verify_data) }
+
+pub fn key_update(request: bool) -> List[u8] {
+    let mut b: List[u8] = List.new()
+    if request { b.push(1) } else { b.push(0) }
+    message(KEY_UPDATE, b)
+}
+
+/// KeyUpdate's `update_requested` (None for a malformed body).
+pub fn parse_key_update(body: List[u8]) -> Option[bool] {
+    if body.len() != 1 { return None }
+    if body[0] == 0 { return Some(false) }
+    if body[0] == 1 { return Some(true) }
+    None
+}
+
+/// NewSessionTicket is parsed for validity and dropped: this package does not resume.
+pub fn valid_new_session_ticket(body: List[u8]) -> bool {
+    let mut r = wire.rd(body)
+    match wire.get_u32(inout r) {
+        Some(_) => {}
+        None => return false
+    }
+    match wire.get_u32(inout r) {
+        Some(_) => {}
+        None => return false
+    }
+    match wire.vec8(inout r) {
+        Some(_) => {}
+        None => return false
+    }
+    match wire.vec16(inout r) {
+        Some(t) => { if wire.left(t) == 0 { return false } }
+        None => return false
+    }
+    match read_extensions(inout r) {
+        Some(_) => {}
+        None => return false
+    }
+    wire.done(r)
+}

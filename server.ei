@@ -1,0 +1,360 @@
+//! tls.server: the TLS 1.3 server handshake: reads the ClientHello, chooses a cipher suite,
+//! a key exchange group (with a HelloRetryRequest when the client sent no share for any
+//! group the server accepts), a signature scheme and an application protocol, sends
+//! ServerHello and the encrypted flight with the configured certificate chain, optionally
+//! asks for and validates a client certificate, and checks the client's Finished.
+//! Not implemented: pre-shared keys, session tickets and resumption, 0-RTT, selecting a
+//! certificate by SNI (one identity per configuration; the chosen name is in
+//! `Conn.server_name`), post-handshake client authentication.
+
+import std.stream
+import std.time
+import crypto
+import tls.alert
+import tls.config
+import tls.conn
+import tls.ct
+import tls.handshake
+import tls.kex
+import tls.keys
+import tls.record
+import tls.suite
+import tls.wire
+import tls.x509
+
+fn usage(m: str) -> alert.Error { alert.fail(alert.Usage, alert.InternalError, m) }
+
+fn unix_now(cfg: config.ServerConfig) -> i64 uses clock {
+    match cfg.now {
+        Some(t) => t
+        None => time.unix_seconds()
+    }
+}
+
+fn contains_u32(xs: List[u32], x: u32) -> bool {
+    for y in xs {
+        if y == x { return true }
+    }
+    false
+}
+
+fn validate(cfg: config.ServerConfig) -> Option[alert.Error] {
+    if cfg.suites.len() == 0 { return Some(usage("config: no cipher suites")) }
+    if cfg.groups.len() == 0 { return Some(usage("config: no key exchange groups")) }
+    for g in cfg.groups {
+        if !kex.supported(g) { return Some(usage("config: an unsupported key exchange group")) }
+    }
+    if cfg.identity.chain.len() == 0 { return Some(usage("config: the identity has no certificates")) }
+    match config.check_alpn(cfg.alpn) {
+        Some(m) => return Some(alert.Error(alert.Usage, alert.InternalError, m, stream.Other))
+        None => {}
+    }
+    None
+}
+
+/// Runs the server handshake on `io`. On failure an alert has been sent (best effort) and the
+/// stream is left for the caller to close. `dl` bounds the whole handshake.
+pub fn accept[S: stream.Reader + stream.Writer](io: S, cfg: config.ServerConfig, dl: time.Deadline) -> Result[conn.Conn[S], alert.Error] uses io, clock {
+    let mut c = conn.new_conn(io, false)
+    match validate(cfg) {
+        Some(e) => return Err(e)
+        None => {}
+    }
+    match run(inout c, cfg, dl) {
+        Ok(_) => Ok(c)
+        Err(e) => Err(conn.die(inout c, e))
+    }
+}
+
+fn read_client_hello[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], dl: time.Deadline) -> Result[(handshake.ClientHello, List[u8]), alert.Error] uses io, clock {
+    let m = conn.next_hs(inout c, dl)?
+    if m.typ != handshake.CLIENT_HELLO {
+        return Err(alert.protocol(alert.UnexpectedMessage, "expected ClientHello"))
+    }
+    match handshake.parse_client_hello(m.body) {
+        Some(ch) => Ok((ch, m.raw))
+        None => Err(alert.protocol(alert.DecodeError, "malformed ClientHello"))
+    }
+}
+
+fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.ServerConfig, dl: time.Deadline) -> Result[(), alert.Error] uses io, clock {
+    let (first, first_raw) = read_client_hello(inout c, dl)?
+    let mut ch = first.copy()
+    if !contains_u32(ch.versions, handshake.TLS13) {
+        return Err(alert.protocol(alert.ProtocolVersion, "the client does not offer TLS 1.3"))
+    }
+    if ch.sigalgs.len() == 0 { return Err(alert.protocol(alert.MissingExtension, "no signature_algorithms")) }
+    if ch.groups.len() == 0 { return Err(alert.protocol(alert.MissingExtension, "no supported_groups")) }
+    let key = cfg.identity.key
+    let scheme = kex.scheme_of(key)
+    if !contains_u32(ch.sigalgs, scheme) {
+        return Err(alert.protocol(alert.HandshakeFailure, "no signature algorithm in common"))
+    }
+    // cipher suite: the server's order of preference
+    let mut chosen_opt: Option[suite.Suite] = None
+    for s in cfg.suites {
+        if chosen_opt.is_none() && contains_u32(ch.suites, suite.code(s)) { chosen_opt = Some(s) }
+    }
+    let chosen = match chosen_opt {
+        Some(s) => s
+        None => return Err(alert.protocol(alert.HandshakeFailure, "no cipher suite in common"))
+    }
+    let h = suite.hash(chosen)
+    // application protocol
+    if cfg.alpn.len() > 0 && ch.alpn.len() > 0 {
+        let mut pick: Option[List[u8]] = None
+        for p in cfg.alpn {
+            for q in ch.alpn {
+                if pick.is_none() && ct.eq(p, q) { pick = Some(p) }
+            }
+        }
+        match pick {
+            Some(p) => { c.alpn = Some(p) }
+            None => return Err(alert.protocol(alert.NoApplicationProtocol, "no application protocol in common"))
+        }
+    }
+    c.server_name = ch.sni
+    c.suite = chosen
+    let mut tr = keys.transcript(h)
+    keys.add(inout tr, first_raw)
+
+    // the group: the server's order of preference, among those the client has a share for
+    let mut group: Option[u32] = None
+    let mut common: Option[u32] = None
+    for g in cfg.groups {
+        if contains_u32(ch.groups, g) {
+            if common.is_none() { common = Some(g) }
+            for s in ch.shares {
+                if s.group == g && group.is_none() { group = Some(g) }
+            }
+        }
+    }
+    let mut ccs_sent = false
+    if group.is_none() {
+        let g = match common {
+            Some(g) => g
+            None => return Err(alert.protocol(alert.HandshakeFailure, "no key exchange group in common"))
+        }
+        // HelloRetryRequest: ask for a share for `g`
+        let hrr = handshake.server_hello(handshake.ServerHello(handshake.hrr_random(), ch.session_id, suite.code(chosen), handshake.TLS13, None, Some(g), None, true))
+        tr = match keys.restart_for_retry(tr, h) {
+            Ok(t) => t
+            Err(e) => return Err(conn.cfail(e))
+        }
+        keys.add(inout tr, hrr)
+        conn.send(inout c, record.HANDSHAKE, hrr, dl)?
+        if ch.session_id.len() > 0 {
+            ccs_sent = true
+            conn.send_ccs(inout c, dl)?
+        }
+        let (second, second_raw) = read_client_hello(inout c, dl)?
+        // the second ClientHello changes only the key shares (RFC 8446 section 4.1.2)
+        if !ct.eq(second.random, ch.random) || !ct.eq(second.session_id, ch.session_id) || second.suites.len() != ch.suites.len() {
+            return Err(alert.protocol(alert.IllegalParameter, "the second ClientHello differs from the first"))
+        }
+        let mut i: usize = 0
+        while i < ch.suites.len() {
+            if second.suites[i] != ch.suites[i] { return Err(alert.protocol(alert.IllegalParameter, "the second ClientHello differs from the first")) }
+            i += 1
+        }
+        if !contains_u32(second.versions, handshake.TLS13) || second.shares.len() != 1 || second.shares[0].group != g {
+            return Err(alert.protocol(alert.IllegalParameter, "the second ClientHello has no key share for the requested group"))
+        }
+        keys.add(inout tr, second_raw)
+        ch = second
+        group = Some(g)
+    }
+    let g = group.unwrap()
+    let mut peer_share: List[u8] = List.new()
+    for s in ch.shares {
+        if s.group == g { peer_share = s.data.copy() }
+    }
+    if !kex.valid_share(g, peer_share) {
+        return Err(alert.protocol(alert.IllegalParameter, "malformed key share"))
+    }
+    let mine = match kex.generate(g) {
+        Ok(k) => k
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let ecdhe = match kex.agree(mine, peer_share) {
+        Ok(s) => s
+        Err(_) => return Err(alert.protocol(alert.IllegalParameter, "invalid key share"))
+    }
+    let random = match crypto.random_bytes(32) {
+        Ok(b) => b
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let sh = handshake.server_hello(handshake.ServerHello(random, ch.session_id, suite.code(chosen), handshake.TLS13,
+        Some(handshake.KeyShare(g, kex.share_of(mine))), None, None, false))
+    keys.add(inout tr, sh)
+    conn.send(inout c, record.HANDSHAKE, sh, dl)?
+    if !ccs_sent && ch.session_id.len() > 0 {
+        conn.send_ccs(inout c, dl)?
+    }
+
+    let early = match keys.early_secret(h) {
+        Ok(e) => e
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let hs = match keys.handshake_secret(early, ecdhe) {
+        Ok(s) => s
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let th0 = match keys.hash(tr) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let c_hs = match keys.derive_secret(hs, "c hs traffic", th0) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let s_hs = match keys.derive_secret(hs, "s hs traffic", th0) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    c.wr = record.protector(chosen, s_hs)?
+    c.wr_on = true
+    c.rd = record.protector(chosen, c_hs)?
+    c.rd_on = true
+
+    // the encrypted flight
+    let ee = handshake.encrypted_extensions(c.alpn, false)
+    keys.add(inout tr, ee)
+    conn.send(inout c, record.HANDSHAKE, ee, dl)?
+    let mut want_client_cert = false
+    let mut require_client_cert = false
+    let mut client_roots = x509.empty_store()
+    match cfg.client_auth {
+        config.NoClientAuth => {}
+        config.RequestClientAuth(roots) => {
+            want_client_cert = true
+            client_roots = roots
+        }
+        config.RequireClientAuth(roots) => {
+            want_client_cert = true
+            require_client_cert = true
+            client_roots = roots
+        }
+    }
+    let mut client_sigalgs: List[u32] = List.new()
+    client_sigalgs.push(handshake.SIG_ED25519)
+    client_sigalgs.push(handshake.SIG_ECDSA_SECP256R1_SHA256)
+    if want_client_cert {
+        let cr = handshake.certificate_request(List.new(), client_sigalgs)
+        keys.add(inout tr, cr)
+        conn.send(inout c, record.HANDSHAKE, cr, dl)?
+    }
+    let cert_msg = handshake.certificate(List.new(), cfg.identity.chain)
+    keys.add(inout tr, cert_msg)
+    conn.send(inout c, record.HANDSHAKE, cert_msg, dl)?
+    let th_cert = match keys.hash(tr) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let sig = match kex.sign(key, keys.cert_verify_content(true, th_cert)) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let cv = handshake.certificate_verify(scheme, sig)
+    keys.add(inout tr, cv)
+    conn.send(inout c, record.HANDSHAKE, cv, dl)?
+    let th_cv = match keys.hash(tr) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let vd = match keys.finished(s_hs, th_cv) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let fin = handshake.finished(vd)
+    keys.add(inout tr, fin)
+    conn.send(inout c, record.HANDSHAKE, fin, dl)?
+    let th_fin = match keys.hash(tr) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let master = match keys.master_secret(hs) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let c_ap = match keys.derive_secret(master, "c ap traffic", th_fin) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let s_ap = match keys.derive_secret(master, "s ap traffic", th_fin) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    c.wr = record.protector(chosen, s_ap)?
+
+    // the client's flight
+    let mut m = conn.next_hs(inout c, dl)?
+    if want_client_cert {
+        if m.typ != handshake.CERTIFICATE {
+            return Err(alert.protocol(alert.UnexpectedMessage, "expected Certificate"))
+        }
+        let cm = match handshake.parse_certificate(m.body) {
+            Some(x) => x
+            None => return Err(alert.protocol(alert.DecodeError, "malformed Certificate"))
+        }
+        if cm.context.len() != 0 { return Err(alert.protocol(alert.IllegalParameter, "Certificate with a context during the handshake")) }
+        keys.add(inout tr, m.raw)
+        if cm.certs.len() == 0 {
+            if require_client_cert {
+                return Err(alert.fail(alert.Certificate, alert.CertificateRequired, "the client sent no certificate"))
+            }
+            m = conn.next_hs(inout c, dl)?
+        } else {
+            let mut chain: List[x509.Cert] = List.new()
+            for der in cm.certs {
+                match x509.parse(der) {
+                    Ok(x) => chain.push(x)
+                    Err(_) => return Err(alert.fail(alert.Certificate, alert.BadCertificate, "malformed certificate"))
+                }
+            }
+            match x509.verify_chain(chain, client_roots, unix_now(cfg), x509.ClientAuth, None) {
+                Ok(_) => {}
+                Err(f) => return Err(conn.cert_failure(f))
+            }
+            c.peer_chain = cm.certs
+            m = conn.next_hs(inout c, dl)?
+            if m.typ != handshake.CERTIFICATE_VERIFY {
+                return Err(alert.protocol(alert.UnexpectedMessage, "expected CertificateVerify"))
+            }
+            let cvm = match handshake.parse_certificate_verify(m.body) {
+                Some(x) => x
+                None => return Err(alert.protocol(alert.DecodeError, "malformed CertificateVerify"))
+            }
+            if !contains_u32(client_sigalgs, cvm.alg) {
+                return Err(alert.protocol(alert.IllegalParameter, "CertificateVerify uses a signature algorithm we did not offer"))
+            }
+            let th = match keys.hash(tr) {
+                Ok(x) => x
+                Err(e) => return Err(conn.cfail(e))
+            }
+            if !kex.verify(chain[0].copy(), cvm.alg, keys.cert_verify_content(false, th), cvm.sig) {
+                return Err(alert.protocol(alert.DecryptError, "bad CertificateVerify signature"))
+            }
+            keys.add(inout tr, m.raw)
+            m = conn.next_hs(inout c, dl)?
+        }
+    }
+    if m.typ != handshake.FINISHED {
+        return Err(alert.protocol(alert.UnexpectedMessage, "expected Finished"))
+    }
+    let th_c = match keys.hash(tr) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    let want = match keys.finished(c_hs, th_c) {
+        Ok(x) => x
+        Err(e) => return Err(conn.cfail(e))
+    }
+    if !ct.eq(want, m.body) {
+        return Err(alert.protocol(alert.DecryptError, "bad Finished MAC"))
+    }
+    if c.hsbuf.len() != 0 { return Err(alert.protocol(alert.UnexpectedMessage, "data after Finished")) }
+    c.rd = record.protector(chosen, c_ap)?
+    c.done = true
+    Ok(())
+}

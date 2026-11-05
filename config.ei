@@ -1,0 +1,134 @@
+//! tls.config: what a client or a server is configured with.
+
+import std.bytes
+import std.fs
+import crypto
+import tls.handshake
+import tls.keyfile
+import tls.pem
+import tls.suite
+import tls.x509
+
+/// A certificate chain (DER, leaf first) and the leaf's private key.
+pub type Identity = { chain: List[List[u8]], key: keyfile.SigningKey }
+
+/// Reads an identity from PEM text: every CERTIFICATE block in `chain_pem` in order, and the
+/// private key in `key_pem`.
+pub fn identity_from_pem(chain_pem: List[u8], key_pem: List[u8]) -> Result[Identity, String] {
+    let blocks = pem.decode_all(chain_pem)?
+    let mut chain: List[List[u8]] = List.new()
+    for b in blocks {
+        if bytes.eq(b.label, "CERTIFICATE".bytes()) { chain.push(b.der) }
+    }
+    if chain.len() == 0 { return Err(String.from("config: no certificate in the chain PEM")) }
+    let key = keyfile.from_pem(key_pem)?
+    // the first certificate must be the one the key belongs to
+    let leaf = x509.parse(chain[0].copy())?
+    let ok = match key {
+        keyfile.EdKey(seed) => {
+            match crypto.ed25519_public(seed) {
+                Ok(p) => leaf_key_is(leaf, x509.Ed25519Key, p.bytes)
+                Err(_) => false
+            }
+        }
+        keyfile.EcKey(sec) => {
+            match crypto.p256_public(sec) {
+                Ok(p) => leaf_key_is(leaf, x509.P256Key, p.bytes)
+                Err(_) => false
+            }
+        }
+    }
+    if !ok { return Err(String.from("config: the private key does not match the first certificate")) }
+    Ok(Identity(chain, key))
+}
+
+fn leaf_key_is(leaf: x509.Cert, kind: x509.KeyKind, pubkey: List[u8]) -> bool {
+    let same_kind = match leaf.key_kind {
+        x509.Ed25519Key => match kind { x509.Ed25519Key => true, _ => false }
+        x509.P256Key => match kind { x509.P256Key => true, _ => false }
+        x509.OtherKey => false
+    }
+    same_kind && bytes.eq(leaf.key, pubkey)
+}
+
+/// Reads an identity from two files.
+pub fn identity_from_files(chain_path: str, key_path: str) -> Result[Identity, String] uses fs {
+    let c = fs.read(chain_path.bytes())?
+    let k = fs.read(key_path.bytes())?
+    identity_from_pem(c, k)
+}
+
+/// How a client treats the server's certificate.
+pub type Verify =
+    | Full
+    | Insecure
+
+pub type ClientConfig = {
+    /// The host name to verify the certificate for and to send as SNI (an IP literal is
+    /// verified against the certificate's IP addresses and not sent as SNI). Required unless
+    /// `verify` is `Insecure`.
+    server_name: Option[List[u8]],
+    roots: x509.Store,
+    /// `Insecure` skips certificate validation (the CertificateVerify signature and the
+    /// Finished MAC are still checked, so the peer holds the key it presented, but it may be
+    /// anyone). For tests only.
+    verify: Verify,
+    alpn: List[List[u8]],
+    suites: List[suite.Suite],
+    groups: List[u32],
+    /// The groups a key share is sent for in the first ClientHello (the others cost a
+    /// HelloRetryRequest round trip if the server wants them).
+    share_groups: List[u32],
+    /// The time certificates are checked at, in Unix seconds (default: the clock).
+    now: Option[i64],
+    /// A certificate to send when the server asks for one.
+    identity: Option[Identity]
+}
+
+pub fn default_groups() -> List[u32] {
+    let mut g: List[u32] = List.new()
+    g.push(handshake.GROUP_X25519)
+    g.push(handshake.GROUP_SECP256R1)
+    g
+}
+
+/// A client config that verifies the server's certificate against `roots` for the host
+/// `server_name`.
+pub fn client_config(server_name: str, roots: x509.Store) -> ClientConfig {
+    let mut share: List[u32] = List.new()
+    share.push(handshake.GROUP_X25519)
+    ClientConfig(Some(server_name.bytes()), roots, Full, List.new(), suite.all(), default_groups(), share, None, None)
+}
+
+/// How a server treats client certificates.
+pub type ClientAuth =
+    | NoClientAuth
+    | RequestClientAuth(roots: x509.Store)
+    | RequireClientAuth(roots: x509.Store)
+
+pub type ServerConfig = {
+    identity: Identity,
+    /// Application protocols in preference order. If empty, ALPN is not negotiated; if not
+    /// empty and the client offers ALPN with none in common, the handshake fails with
+    /// no_application_protocol.
+    alpn: List[List[u8]],
+    suites: List[suite.Suite],
+    groups: List[u32],
+    client_auth: ClientAuth,
+    now: Option[i64]
+}
+
+pub fn server_config(identity: Identity) -> ServerConfig {
+    ServerConfig(identity, List.new(), suite.all(), default_groups(), NoClientAuth, None)
+}
+
+/// The first reason a configuration cannot work, or None.
+pub fn check_alpn(alpn: List[List[u8]]) -> Option[String] {
+    let mut total: usize = 0
+    for p in alpn {
+        if p.len() == 0 || p.len() > 255 { return Some(String.from("config: an ALPN protocol name must be 1 to 255 bytes")) }
+        total += p.len() + 1
+    }
+    if total > 60000 { return Some(String.from("config: ALPN list too long")) }
+    None
+}
