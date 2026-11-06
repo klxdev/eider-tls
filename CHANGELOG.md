@@ -3,7 +3,7 @@
 eider-tls's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.1
 
 - The tests and the README use `let mut` instead of the removed `var` (eider-lang#2, Eider 0.7.5; `let mut` is valid in 0.7 too). No change to the library.
 
