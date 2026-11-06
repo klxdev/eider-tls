@@ -55,6 +55,11 @@ if [ -n "$TSAN" ]; then
     echo "skip tsan runs ($TSAN): ${CC:-cc} cannot build a -fsanitize=thread program"
   fi
 fi
+# the sanitized crypto backend is built by an eider-lang checkout's scripts/crypto-build.sh
+if [ -n "$ASAN" ] && [ ! -f "$toolchain/scripts/crypto-build.sh" ]; then
+  echo "skip asan runs: $toolchain is an installed toolchain (the sanitized crypto backend needs an eider-lang checkout: EIDER_TOOLCHAIN=...)"
+  ASAN=
+fi
 if [ -n "$ASAN" ]; then
   A=$(mktemp -d)
   trap 'rm -rf "$A"' EXIT

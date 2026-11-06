@@ -90,12 +90,6 @@ for d in $DEPS; do
 done
 export EIDER_PKG_OVERRIDE
 
-# packages/crypto is part of eider-lang's checkout, not of an installed toolchain, and has no
-# repository of its own yet: eider.toml's `path = "target/deps/crypto"` is a link to it.
-if [ -d "$toolchain/packages/crypto" ]; then
-  mkdir -p "$here/target/deps"
-  rm -f "$here/target/deps/crypto"
-  ln -s "$toolchain/packages/crypto" "$here/target/deps/crypto"
-else
-  die "$toolchain has no packages/crypto: eider-tls needs an eider-lang checkout as its toolchain (EIDER_TOOLCHAIN) until the crypto package is published"
-fi
+# crypto is the toolchain's own package (eider.toml's `[deps.crypto] toolchain = true`, Eider 0.7.6
+# and later: the toolchain's packages/crypto and its libeider_crypto backend): nothing to link.
+[ -d "$toolchain/packages/crypto" ] || die "$toolchain ($chosen) is Eider $theirs, which does not ship packages/crypto; eider-$pkg_name $mine needs Eider 0.7.6 or later (\`eider toolchain install 0.7\`)"

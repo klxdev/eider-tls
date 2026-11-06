@@ -5,8 +5,8 @@ eider = "0.7"
 description = "TLS 1.3 (RFC 8446) client and server and X.509 certificate verification, written in Eider over the crypto package's primitives"
 
 # The primitives: hashes, HMAC, HKDF, AEAD, X25519, Ed25519 and P-256 over the core's crypto
-# provider. The package lives in eider-lang's checkout (packages/crypto) and is not published
-# on its own yet: scripts/env.sh links it at target/deps/crypto.
+# provider. The package comes with the toolchain (Eider 0.7.6 and later: its packages/crypto
+# and the libeider_crypto backend it links), so it is declared as the toolchain's, not fetched.
 [deps.crypto]
-path = "target/deps/crypto"
+toolchain = true
 uses = ["io"]
