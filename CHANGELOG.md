@@ -3,6 +3,13 @@
 eider-tls's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
+## Unreleased
+
+- The crypto dependency is the toolchain's own package, `[deps.crypto] toolchain = true`, instead of a path
+  dependency on a link to an eider-lang checkout (eider-lang#222; needs Eider 0.7.6, which ships `packages/crypto` and
+  its backend). `scripts/env.sh` no longer makes `target/deps/crypto`; with an installed toolchain alone, `scripts/build.sh`
+  and `scripts/test.sh` work. The first release carrying this requires Eider 0.7.6 or later.
+
 ## 0.7.1
 
 - The tests and the README use `let mut` instead of the removed `var` (eider-lang#2, Eider 0.7.5; `let mut` is valid in 0.7 too). No change to the library.

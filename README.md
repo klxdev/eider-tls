@@ -75,7 +75,7 @@ way to forget to verify the host name.
 
 ## What is tested
 
-`sh scripts/test.sh` runs everything below (needs an eider-lang checkout as the toolchain, see "Developing"):
+`sh scripts/test.sh` runs everything below (an installed Eider 0.7.6 or later is enough; `ASAN=1` also needs an eider-lang checkout, see "Developing"):
 
 - **Interoperability with `openssl s_server` and `s_client` 3.5.8** (`tests/interop.sh`, 36 cases over loopback with
   the CA and certificates in `tests/pki`): all three suites, both groups, an Ed25519 leaf through an intermediate and
@@ -145,9 +145,9 @@ way to forget to verify the host name.
 - **I/O model**: the handshake blocks the calling task up to its deadline (it is not a state machine you can
   suspend); after it, the sans-I/O core (`conn.ei`) can be driven by any readiness loop through `try_recv`,
   `ready_to_read` and the `..._by` calls.
-- **The crypto dependency** is `path = "target/deps/crypto"`, a link `scripts/env.sh` makes to `packages/crypto` of the
-  eider-lang checkout used as the toolchain. An installed toolchain does not ship that package, so eider-tls needs
-  an eider-lang checkout (`EIDER_TOOLCHAIN`) until the crypto package has a repository of its own.
+- **The crypto dependency** is the toolchain's own package, `[deps.crypto] toolchain = true` (Eider 0.7.6 and later
+  ship `packages/crypto` and the AWS-LC backend in the toolchain), so an installed toolchain is enough; a program
+  that uses eider-tls does the same in its eider.toml (`[deps.crypto] toolchain = true`, `uses = ["io"]`).
 - No benchmarks; the handshake costs two P-256/X25519 operations plus the signature in the provider and some
   list copying in Eider.
 
@@ -168,13 +168,14 @@ tests/                    *_test.ei with their .out, interop.sh, pki/ (fixtures)
 ## Developing
 
 ```sh
-sh scripts/build.sh                 # check every module (needs an eider-lang checkout: EIDER_TOOLCHAIN=...)
+sh scripts/build.sh                 # check every module (with the installed toolchain, or EIDER_TOOLCHAIN=...)
 sh scripts/test.sh                  # build, run every test, interop against openssl, TSan
-ASAN=1 sh scripts/test.sh           # and AddressSanitizer + UBSan
+ASAN=1 sh scripts/test.sh           # and AddressSanitizer + UBSan (builds the crypto backend sanitized: an eider-lang checkout as the toolchain)
 sh tests/pki.sh /tmp/pki            # regenerate the test PKI (needs openssl; tests/pki is committed, valid to 2036)
 ```
 
-The toolchain is an eider-lang checkout: `EIDER_TOOLCHAIN=~/workplace/eider-lang sh scripts/test.sh`. The tests fix
+The toolchain is the installed one (`eider toolchain install 0.7`) or, for unreleased work, an eider-lang checkout:
+`EIDER_TOOLCHAIN=~/workplace/eider-lang sh scripts/test.sh`. The tests fix
 the clock they validate certificates at (`ClientConfig.now`), so they do not depend on the date; `tests/interop.sh`
 uses the real clock, and the fixtures expire in November 2036.
 
