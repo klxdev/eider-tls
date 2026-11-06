@@ -3,7 +3,7 @@
 eider-tls's versions (semver). Before 1.0 the MAJOR.MINOR is the Eider toolchain's it goes
 with (`eider` in eider.toml), the PATCH its own.
 
-## Unreleased
+## 0.7.2
 
 - RSA and P-384 (eider-lang#221, Eider 0.7.6): signature schemes rsa_pss_rsae_sha256/384/512, rsa_pkcs1_sha256/384/512
   (certificates only) and ecdsa_secp384r1_sha384; group secp384r1; chain verification for RSA (PKCS#1 v1.5 and PSS)
