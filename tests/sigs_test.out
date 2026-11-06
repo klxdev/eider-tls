@@ -1,0 +1,82 @@
+== signature algorithms of the fixtures
+rsa2048.pem: key RsaKey, signed with rsa-pkcs1 Sha256
+rsa-inter.pem: key RsaKey, signed with rsa-pkcs1 Sha256
+rsa3072.pem: key RsaKey, signed with rsa-pkcs1 Sha384
+rsa-sha512.pem: key RsaKey, signed with rsa-pkcs1 Sha512
+rsa-pss.pem: key RsaKey, signed with rsa-pss Sha256 salt 32
+rsa-pss384.pem: key RsaKey, signed with rsa-pss Sha384 salt 48
+p384.pem: key P384Key, signed with ecdsa Sha384
+p256-by-p384.pem: key P256Key, signed with ecdsa Sha384
+p256-sha512.pem: key P256Key, signed with ecdsa Sha512
+p384-by-p256.pem: key P384Key, signed with ecdsa Sha256
+rsa-pss-mgf1sha1.pem: key RsaKey, signed with unsupported
+rsa-root.pem: key RsaKey, signed with rsa-pkcs1 Sha384
+p384-root.pem: key P384Key, signed with ecdsa Sha384
+ec.pem: key P256Key, signed with ecdsa Sha256
+ed.pem: key Ed25519Key, signed with ed25519
+sha384sig.pem: key Ed25519Key, signed with ecdsa Sha384
+rsasigned.pem: key Ed25519Key, signed with rsa-pkcs1 Sha256
+== chains
+rsa-2048 leaf via RSA intermediate to an RSA-3072 root: ok
+rsa-3072 leaf, sha384WithRSAEncryption: ok
+rsa-2048 leaf, sha512WithRSAEncryption: ok
+rsa-2048 leaf, RSASSA-PSS sha256: ok
+rsa-2048 leaf, RSASSA-PSS sha384 salt 48: ok
+p384 leaf, ecdsa-with-SHA384: ok
+p256 leaf under a P-384 root, ecdsa-with-SHA384: ok
+p256 leaf under a P-384 root, ecdsa-with-SHA512: ok
+p384 leaf under a P-256 root, ecdsa-with-SHA256: ok
+rsa leaf, wrong root (P-384): unable to find a trusted issuer
+rsa leaf, the RSA root is not in the store: unable to find a trusted issuer
+p384 leaf, root of another family: unable to find a trusted issuer
+RSASSA-PSS with SHA-256 and MGF1 with SHA-1: unsupported certificate signature algorithm (verified: ed25519, ecdsa-with-SHA256/384/512, sha256/384/512WithRSAEncryption, RSASSA-PSS with SHA-2)
+the older sha384 fixture, signed by a CA that is not in the store: unable to find a trusted issuer
+a chain through a 1024-bit RSA root: the issuer's RSA key is outside 2048 to 8192 bits or otherwise unusable
+rsa2048 leaf alone (no intermediate): unable to find a trusted issuer
+rsa2048 chain, wrong name: certificate is not valid for the host name
+rsa client certificate as client: ok
+p384 client certificate as client: ok
+== tampering
+rsa leaf: last byte of the signature: certificate signature does not verify
+rsa leaf: first byte of the signature: certificate signature does not verify
+rsa leaf: signature one byte short: certificate signature does not verify
+rsa leaf: the signed bytes: certificate signature does not verify
+rsa-pss leaf: a byte of the signature: certificate signature does not verify
+p384 leaf: the signature: certificate signature does not verify
+p384 leaf: the signed bytes: certificate signature does not verify
+sha384 signature checked as sha384 (control): ok
+signed_by: leaf by intermediate true, intermediate by leaf false, leaf by the root false
+== the handshake signature schemes
+rsa-2048: schemes 3 2052:true/false/false 2053:true/false/false 2054:true/false/false
+rsa-2048 from PKCS#1: schemes 3 2052:true/false/false 2053:true/false/false 2054:true/false/false
+rsa-3072: schemes 3 2052:true/false/false 2053:true/false/false 2054:true/false/false
+p384: schemes 1 1283:true/false/false
+p384 from SEC1: schemes 1 1283:true/false/false
+p256 (pkcs8): schemes 1 1027:true/false/false
+p256 from SEC1: schemes 1 1027:true/false/false
+ed25519: schemes 1 2055:true/false/false
+rsa-pss signature under: its own cert true, as sha384 false, as sha512 false, as ecdsa p256 false, as ecdsa p384 false, as ed25519 false, another RSA cert false
+rsa-pkcs1 signature as CertificateVerify: false, and the scheme is allowed in a handshake: false
+an rsa-pss signature under an Ed25519 certificate: false
+p384 signature: with a P-256 certificate false, as ecdsa_secp256r1_sha256 false
+sign with a scheme the key does not have: rsa key / ecdsa true, p384 key / ecdsa p256 true, rsa key / pkcs1 true
+picked: rsa/all Some(2052), rsa/sha512 only Some(2054), rsa/p256 only None, p384/all Some(1283), p384/p256 only None
+== key files
+rsa2048.key: rsa 2048
+rsa2048.pkcs1.key: rsa 2048
+rsa3072.key: rsa 3072
+p384.key: ec p384
+p384.sec1.key: ec p384
+p256-by-p384.key: ec p256
+p256-by-p384.sec1.key: ec p256
+ed.key: ed25519
+client.key: ed25519
+a certificate read as a key: keyfile: no private key in the PEM text
+pkcs8 with a trailing byte: keyfile: unsupported or malformed PKCS#8 private key
+truncated pkcs8: keyfile: unsupported or malformed PKCS#8 private key
+== key exchange
+group 29: supported true, share 32 bytes, valid true, agree true, secret 32 bytes
+group 23: supported true, share 65 bytes, valid true, agree true, secret 32 bytes
+group 24: supported true, share 97 bytes, valid true, agree true, secret 48 bytes
+secp384r1 share off the curve: true
+secp384r1 share of 65 bytes valid: false; of 97 bytes starting 0x02: false

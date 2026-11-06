@@ -116,7 +116,7 @@ fn main() uses io, fs {
     show("no certificate", x509.verify_chain(List.new(), root, now, x509.ServerAuth, None))
     // the leaf is itself the trust anchor
     show("pinned leaf", x509.verify_chain(l1(leaf), store_of("ed.pem"), now, x509.ServerAuth, host("localhost")))
-    // signature algorithms and key types this package does not verify (RSA, ECDSA with SHA-384)
+    // ECDSA with SHA-384 and RSA (more in tests/sigs_test.ei)
     show("signed with ecdsa-with-SHA384", x509.verify_chain(certs("sha384sig.pem"), root, now, x509.ServerAuth, host("localhost")))
     show("signed with RSA", x509.verify_chain(certs("rsasigned.pem"), store_of("rsaroot.pem"), now, x509.ServerAuth, host("localhost")))
     let rsaroot = one("rsaroot.pem")

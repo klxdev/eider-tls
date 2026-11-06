@@ -78,12 +78,7 @@ fn contains_u32(xs: List[u32], x: u32) -> bool {
     false
 }
 
-fn sigalg_list() -> List[u32] {
-    let mut l: List[u32] = List.new()
-    l.push(handshake.SIG_ED25519)
-    l.push(handshake.SIG_ECDSA_SECP256R1_SHA256)
-    l
-}
+fn sigalg_list() -> List[u32] { kex.sigalgs() }
 
 /// Runs the client handshake on `io` and returns the connection. On failure an alert has been
 /// sent (best effort) and the stream is left for the caller to close. `dl` bounds the whole
@@ -335,7 +330,7 @@ fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.Clie
         Some(x) => x
         None => return Err(alert.protocol(alert.DecodeError, "malformed CertificateVerify"))
     }
-    if !contains_u32(sigalg_list(), cv.alg) {
+    if !contains_u32(sigalg_list(), cv.alg) || !kex.handshake_scheme(cv.alg) {
         return Err(alert.protocol(alert.IllegalParameter, "CertificateVerify uses a signature algorithm we did not offer"))
     }
     let th_cert = match keys.hash(tr) {
@@ -388,8 +383,9 @@ fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.Clie
             let mut sent_cert = false
             match cfg.identity {
                 Some(id) => {
-                    let scheme = kex.scheme_of(id.key)
-                    if contains_u32(r.sigalgs, scheme) {
+                    let picked = kex.pick_scheme(id.key, r.sigalgs)
+                    if picked.is_some() {
+                        let scheme = picked.unwrap()
                         let msg = handshake.certificate(List.new(), id.chain)
                         keys.add(inout tr, msg)
                         conn.send(inout c, record.HANDSHAKE, msg, dl)?
@@ -397,7 +393,7 @@ fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.Clie
                             Ok(x) => x
                             Err(e) => return Err(conn.cfail(e))
                         }
-                        let sig = match kex.sign(id.key, keys.cert_verify_content(false, th)) {
+                        let sig = match kex.sign(id.key, scheme, keys.cert_verify_content(false, th)) {
                             Ok(x) => x
                             Err(e) => return Err(conn.cfail(e))
                         }

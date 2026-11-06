@@ -432,6 +432,28 @@ fn main() uses io, fs, net, threads, clock {
 
     scenario("ECDSA P-256 leaf", good_c, server_cfg("ec.pem", "ec.key"))
 
+    // RSA and P-384 (certificates by tests/pki-rsa.sh)
+    let rsa_c = client_cfg("localhost", "rsa-root.pem")
+    scenario("RSA-2048 leaf via an RSA-2048 intermediate under an RSA-3072 root (rsa_pss_rsae_sha256)", rsa_c, server_cfg("rsa2048chain.pem", "rsa2048.key"))
+    scenario("RSA-2048 key from a PKCS#1 file", rsa_c, config.server_config(config.identity_from_pem(rd("rsa2048chain.pem"), rd("rsa2048.pkcs1.key")).unwrap()))
+    scenario("RSA-3072 leaf signed with sha384WithRSAEncryption", rsa_c, server_cfg("rsa3072.pem", "rsa3072.key"))
+    scenario("RSA leaf signed with RSASSA-PSS", rsa_c, server_cfg("rsa-pss.pem", "rsa-pss.key"))
+    scenario("RSA leaf with the RSA root missing from the client's store", client_cfg("localhost", "root.pem"), server_cfg("rsa3072.pem", "rsa3072.key"))
+    let p384_c = client_cfg("localhost", "p384-root.pem")
+    scenario("P-384 leaf (ecdsa_secp384r1_sha384)", p384_c, server_cfg("p384.pem", "p384.key"))
+    scenario("P-256 leaf signed by a P-384 root with ecdsa-with-SHA384", p384_c, server_cfg("p256-by-p384.pem", "p256-by-p384.key"))
+    scenario("P-384 leaf signed by a P-256 root with ecdsa-with-SHA256", client_cfg("localhost", "p256-root.pem"), server_cfg("p384-by-p256.pem", "p384-by-p256.key"))
+    // secp384r1 key exchange, and HelloRetryRequest into it
+    c = client_cfg("localhost", "root.pem")
+    c.groups = List.new()
+    c.groups.push(handshake.GROUP_SECP384R1)
+    c.share_groups = c.groups.copy()
+    scenario("secp384r1 key exchange", c, ed_s)
+    let mut s384 = server_cfg("edchain.pem", "ed.key")
+    s384.groups = List.new()
+    s384.groups.push(handshake.GROUP_SECP384R1)
+    scenario("HelloRetryRequest into secp384r1", good_c, s384)
+
     // HelloRetryRequest: the client sends an X25519 share, the server only takes P-256
     let mut s = server_cfg("edchain.pem", "ed.key")
     s.groups = List.new()
@@ -486,6 +508,12 @@ fn main() uses io, fs, net, threads, clock {
     scenario("client certificate requested, none configured", good_c, s)
     s.client_auth = config.RequireClientAuth(roots("other-root.pem"))
     scenario("client certificate from an untrusted CA", c, s)
+    s.client_auth = config.RequireClientAuth(roots("rsa-root.pem"))
+    c.identity = Some(identity("rsa-client.pem", "rsa-client.key"))
+    scenario("client certificate (RSA-2048), required", c, s)
+    s.client_auth = config.RequireClientAuth(roots("p384-root.pem"))
+    c.identity = Some(identity("p384-client.pem", "p384-client.key"))
+    scenario("client certificate (P-384), required", c, s)
 
     // server certificate failures
     scenario("wrong host name", client_cfg("evil.example", "root.pem"), ed_s)

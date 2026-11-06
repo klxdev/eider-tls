@@ -72,4 +72,4 @@ Ed25519 PKCS#8: true
 EC SEC1: true
 certificate is not a key: false
 Ed25519 key: prefixes and byte changes that still load: 32
-EC key: prefixes and byte changes that still load: 104
+EC key: prefixes and byte changes that still load: 0

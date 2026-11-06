@@ -1,6 +1,7 @@
 //! tls.keyfile: private keys for a server: PKCS#8 (`PRIVATE KEY`, RFC 5958) holding an
-//! Ed25519 key (RFC 8410) or a P-256 key, and SEC1 (`EC PRIVATE KEY`, RFC 5915). Encrypted
-//! keys and other algorithms are refused.
+//! Ed25519 key (RFC 8410), an EC key on P-256 or P-384 or an RSA key of 2048 to 8192 bits,
+//! SEC1 (`EC PRIVATE KEY`, RFC 5915) and PKCS#1 (`RSA PRIVATE KEY`, RFC 8017). Encrypted
+//! keys and other algorithms are refused. The EC and RSA parsing is the crypto package's.
 
 import std.bytes
 import crypto
@@ -11,36 +12,24 @@ import tls.wire
 /// A signing key and, for the certificate check, its public half.
 pub type SigningKey =
     | EdKey(seed: crypto.Ed25519Seed)
-    | EcKey(secret: crypto.P256Secret)
+    | EcKey(secret: crypto.EcSecret)
+    | RsaSigKey(key: crypto.RsaPrivate)
 
 fn oid_ed25519() -> List[u8] { wire.hex("2b6570") }
-fn oid_ec_public_key() -> List[u8] { wire.hex("2a8648ce3d0201") }
-fn oid_prime256v1() -> List[u8] { wire.hex("2a8648ce3d030107") }
-
-// ECPrivateKey ::= SEQUENCE { version INTEGER 1, privateKey OCTET STRING, [0] parameters,
-// [1] publicKey }
-fn sec1(d: asn1.Dr, seq: asn1.Tlv) -> Option[SigningKey] {
-    let mut s = asn1.into(d, seq)
-    let v = asn1.expect(inout s, asn1.INTEGER)?
-    if asn1.small_uint(d, v)? != 1 { return None }
-    let k = asn1.expect(inout s, asn1.OCTET_STRING)?
-    let sec = asn1.content(d, k)
-    if sec.len() != 32 { return None }
-    match asn1.expect(inout s, asn1.explicit(0)) {
-        Some(p) => {
-            let mut pr = asn1.into(d, p)
-            let o = asn1.expect(inout pr, asn1.OID)?
-            if !asn1.is_oid(d, o, oid_prime256v1()) { return None }
+fn crypto_key(der: List[u8]) -> Option[SigningKey] {
+    match crypto.private_key_from_der(der) {
+        Ok(k) => {
+            match k {
+                crypto.EcPrivateKey(s) => Some(EcKey(s))
+                crypto.RsaPrivateKey(r) => Some(RsaSigKey(r))
+            }
         }
-        None => {}
-    }
-    match crypto.p256_secret(sec) {
-        Ok(x) => Some(EcKey(x))
         Err(_) => None
     }
 }
 
-fn pkcs8(d: asn1.Dr, seq: asn1.Tlv) -> Option[SigningKey] {
+// PKCS#8: an Ed25519 key is read here (RFC 8410), the others are the crypto package's
+fn pkcs8(d: asn1.Dr, seq: asn1.Tlv, der: List[u8]) -> Option[SigningKey] {
     let mut s = asn1.into(d, seq)
     let v = asn1.expect(inout s, asn1.INTEGER)?
     // version 0 (v1) or 1 (v2 with a public key attribute)
@@ -61,14 +50,7 @@ fn pkcs8(d: asn1.Dr, seq: asn1.Tlv) -> Option[SigningKey] {
             Err(_) => return None
         }
     }
-    if asn1.is_oid(d, oid, oid_ec_public_key()) {
-        let curve = asn1.expect(inout ar, asn1.OID)?
-        if !asn1.is_oid(d, curve, oid_prime256v1()) { return None }
-        let ec = asn1.expect(inout kr, asn1.SEQUENCE)?
-        if !asn1.done(kr) { return None }
-        return sec1(d, ec)
-    }
-    None
+    crypto_key(der)
 }
 
 /// The key in a DER PKCS#8 `PrivateKeyInfo`.
@@ -80,33 +62,47 @@ pub fn from_pkcs8(der: List[u8]) -> Result[SigningKey, String] {
         None => return Err(bad)
     }
     if !asn1.done(d) { return Err(bad) }
-    match pkcs8(d, seq) {
+    match pkcs8(d, seq, der) {
         Some(k) => Ok(k)
         None => Err(bad)
     }
 }
 
-/// The key in a DER SEC1 `ECPrivateKey`.
+/// The key in a DER SEC1 `ECPrivateKey` (P-256 or P-384).
 pub fn from_sec1(der: List[u8]) -> Result[SigningKey, String] {
-    let mut d = asn1.reader(der)
     let bad = String.from("keyfile: unsupported or malformed EC private key")
-    let seq = match asn1.expect(inout d, asn1.SEQUENCE) {
-        Some(s) => s
-        None => return Err(bad)
-    }
-    if !asn1.done(d) { return Err(bad) }
-    match sec1(d, seq) {
-        Some(k) => Ok(k)
+    match crypto_key(der) {
+        Some(k) => {
+            match k {
+                EcKey(_) => Ok(k)
+                _ => Err(bad)
+            }
+        }
         None => Err(bad)
     }
 }
 
-/// The first private key in PEM text: `PRIVATE KEY` or `EC PRIVATE KEY`.
+/// The key in a DER PKCS#1 `RSAPrivateKey` (2048 to 8192 bits).
+pub fn from_pkcs1(der: List[u8]) -> Result[SigningKey, String] {
+    let bad = String.from("keyfile: unsupported or malformed RSA private key")
+    match crypto_key(der) {
+        Some(k) => {
+            match k {
+                RsaSigKey(_) => Ok(k)
+                _ => Err(bad)
+            }
+        }
+        None => Err(bad)
+    }
+}
+
+/// The first private key in PEM text: `PRIVATE KEY`, `EC PRIVATE KEY` or `RSA PRIVATE KEY`.
 pub fn from_pem(text: List[u8]) -> Result[SigningKey, String] {
     let blocks = pem.decode_all(text)?
     for b in blocks {
         if bytes.eq(b.label, "PRIVATE KEY".bytes()) { return from_pkcs8(b.der) }
         if bytes.eq(b.label, "EC PRIVATE KEY".bytes()) { return from_sec1(b.der) }
+        if bytes.eq(b.label, "RSA PRIVATE KEY".bytes()) { return from_pkcs1(b.der) }
         if bytes.eq(b.label, "ENCRYPTED PRIVATE KEY".bytes()) { return Err(String.from("keyfile: encrypted private keys are not supported")) }
     }
     Err(String.from("keyfile: no private key in the PEM text"))

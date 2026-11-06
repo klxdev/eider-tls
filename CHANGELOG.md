@@ -5,6 +5,11 @@ with (`eider` in eider.toml), the PATCH its own.
 
 ## Unreleased
 
+- RSA and P-384 (eider-lang#221, Eider 0.7.6): signature schemes rsa_pss_rsae_sha256/384/512, rsa_pkcs1_sha256/384/512
+  (certificates only) and ecdsa_secp384r1_sha384; group secp384r1; chain verification for RSA (PKCS#1 v1.5 and PSS)
+  and ECDSA-SHA256/384/512 signatures, RSA 2048-8192 and P-384 keys; RSA and P-384 server and client keys. 117 of the
+  121 roots of the system CA bundle verify as trust anchors (3 before). Tests: tests/pki-rsa.sh fixtures,
+  tests/sigs_test.ei, loopback and interop cases against OpenSSL in both directions.
 - The crypto dependency is the toolchain's own package, `[deps.crypto] toolchain = true`, instead of a path
   dependency on a link to an eider-lang checkout (eider-lang#222; needs Eider 0.7.6, which ships `packages/crypto` and
   its backend). `scripts/env.sh` no longer makes `target/deps/crypto`; with an installed toolchain alone, `scripts/build.sh`

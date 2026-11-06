@@ -13,6 +13,36 @@ secp256r1 key exchange
 ECDSA P-256 leaf
   client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
   server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+RSA-2048 leaf via an RSA-2048 intermediate under an RSA-3072 root (rsa_pss_rsae_sha256)
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+RSA-2048 key from a PKCS#1 file
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+RSA-3072 leaf signed with sha384WithRSAEncryption
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+RSA leaf signed with RSASSA-PSS
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+RSA leaf with the RSA root missing from the client's store
+  client: handshake failed: tls: unable to find a trusted issuer (sent alert unknown_ca)
+  server: handshake failed: tls: the peer rejected the connection
+P-384 leaf (ecdsa_secp384r1_sha384)
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+P-256 leaf signed by a P-384 root with ecdsa-with-SHA384
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+P-384 leaf signed by a P-256 root with ecdsa-with-SHA256
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+secp384r1 key exchange
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=false
+HelloRetryRequest into secp384r1
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=true
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=true
 HelloRetryRequest
   client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=true
   server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=0 key_updates_in=0 retried=true
@@ -46,6 +76,12 @@ client certificate requested, none configured
 client certificate from an untrusted CA
   client: transfer failed: tls: the peer rejected the connection
   server: handshake failed: tls: unable to find a trusted issuer (sent alert unknown_ca)
+client certificate (RSA-2048), required
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=1 key_updates_in=0 retried=false
+client certificate (P-384), required
+  client: connected TLS_AES_128_GCM_SHA256 alpn=- reply_ok=true key_updates_in=0 out=0 retried=false
+  server: served TLS_AES_128_GCM_SHA256 alpn=- sni=localhost peer_certs=1 key_updates_in=0 retried=false
 wrong host name
   client: handshake failed: tls: certificate is not valid for the host name (sent alert bad_certificate)
   server: handshake failed: tls: the peer rejected the connection

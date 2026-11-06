@@ -32,8 +32,20 @@ pub fn identity_from_pem(chain_pem: List[u8], key_pem: List[u8]) -> Result[Ident
             }
         }
         keyfile.EcKey(sec) => {
-            match crypto.p256_public(sec) {
-                Ok(p) => leaf_key_is(leaf, x509.P256Key, p.bytes)
+            match crypto.ec_public(sec) {
+                Ok(p) => leaf_key_is(leaf, if sec.curve == crypto.P384 { x509.P384Key } else { x509.P256Key }, p.bytes)
+                Err(_) => false
+            }
+        }
+        keyfile.RsaSigKey(sk) => {
+            // the same RSA public key: modulus and exponent of the certificate's SubjectPublicKeyInfo
+            match crypto.public_key_from_spki(leaf.spki) {
+                Ok(pk) => {
+                    match pk {
+                        crypto.RsaKey(r) => bytes.eq(r.blob, crypto.rsa_public_of(sk).blob)
+                        _ => false
+                    }
+                }
                 Err(_) => false
             }
         }
@@ -46,6 +58,8 @@ fn leaf_key_is(leaf: x509.Cert, kind: x509.KeyKind, pubkey: List[u8]) -> bool {
     let same_kind = match leaf.key_kind {
         x509.Ed25519Key => match kind { x509.Ed25519Key => true, _ => false }
         x509.P256Key => match kind { x509.P256Key => true, _ => false }
+        x509.P384Key => match kind { x509.P384Key => true, _ => false }
+        x509.RsaKey => false
         x509.OtherKey => false
     }
     same_kind && bytes.eq(leaf.key, pubkey)
@@ -89,6 +103,7 @@ pub fn default_groups() -> List[u32] {
     let mut g: List[u32] = List.new()
     g.push(handshake.GROUP_X25519)
     g.push(handshake.GROUP_SECP256R1)
+    g.push(handshake.GROUP_SECP384R1)
     g
 }
 

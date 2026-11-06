@@ -1,0 +1,110 @@
+// A survey of the operating system's CA bundle: how many of its roots this package can use as
+// trust anchors, by key type and signature algorithm. A root is usable when its public key is one
+// the crypto package takes (RSA 2048-8192 bits, P-256, P-384, Ed25519) and its own signature, which
+// is made with the algorithm the CA signs its certificates with, verifies. The output depends on the
+// machine, so there is no .out file: scripts/test.sh runs only tests with one.
+//
+//   ei run tests/roots_survey.ei
+
+import std.bytes
+import std.io
+import std.utf8
+import crypto
+import tls.x509
+
+fn rsa_bits_of(c: x509.Cert) -> usize {
+    match crypto.public_key_from_spki(c.spki) {
+        Ok(k) => {
+            match k {
+                crypto.RsaKey(r) => crypto.rsa_bits(r)
+                _ => 0
+            }
+        }
+        Err(_) => 0
+    }
+}
+
+fn scheme_name(s: x509.SigScheme) -> String {
+    match s {
+        x509.SigEd25519 => String.from("ed25519")
+        x509.SigEcdsa(h) => "ecdsa-with-{h}"
+        x509.SigRsaPkcs1(h) => "rsa-pkcs1-{h}"
+        x509.SigRsaPss(h, salt) => "rsa-pss-{h}"
+        x509.SigUnsupported => String.from("unsupported")
+    }
+}
+
+fn kind_name(c: x509.Cert) -> String {
+    match c.key_kind {
+        x509.Ed25519Key => String.from("Ed25519")
+        x509.P256Key => String.from("P-256")
+        x509.P384Key => String.from("P-384")
+        x509.RsaKey => "RSA-{rsa_bits_of(c)}"
+        x509.OtherKey => String.from("other key type")
+    }
+}
+
+fn bump(inout names: List[String], inout counts: List[usize], n: String) {
+    let mut i: usize = 0
+    while i < names.len() {
+        if names[i] == n {
+            counts[i] += 1
+            return
+        }
+        i += 1
+    }
+    names.push(n)
+    counts.push(1)
+}
+
+fn main() uses io, fs {
+    let st = match x509.system_store() {
+        Ok(s) => s
+        Err(e) => {
+            print("no system store: {e}")
+            return
+        }
+    }
+    let mut kinds: List[String] = List.new()
+    let mut kind_counts: List[usize] = List.new()
+    let mut sigs: List[String] = List.new()
+    let mut sig_counts: List[usize] = List.new()
+    let mut usable: usize = 0
+    let mut bad_self: usize = 0
+    let mut unsupported_sig: usize = 0
+    let mut unsupported_key: usize = 0
+    let mut rsa_pss: usize = 0
+    for c in st.roots {
+        let k = kind_name(c)
+        let s = x509.sig_scheme(c)
+        bump(inout kinds, inout kind_counts, k)
+        bump(inout sigs, inout sig_counts, scheme_name(s))
+        if x509.is_unsupported(s) {
+            unsupported_sig += 1
+            let hexs = utf8.lossy(bytes.hex(c.sig_alg))
+            print("  unusable: key {k}, signature algorithm {hexs}")
+        } else if x509.key_problem(c, s).is_some() {
+            unsupported_key += 1
+            print("  unusable: key {k}, signed with {scheme_name(s)}")
+        } else if x509.signed_by(c, c) {
+            usable += 1
+        } else {
+            bad_self += 1
+        }
+    }
+    print("system store: {st.roots.len()} roots ({st.skipped} skipped as unparsable)")
+    print("usable as trust anchors (key supported, own signature verifies): {usable}")
+    print("not usable: {unsupported_sig} with an unsupported signature algorithm, {unsupported_key} whose key does not fit its signature algorithm or the key policy, {bad_self} whose own signature does not verify")
+    print("by key:")
+    let mut i: usize = 0
+    while i < kinds.len() {
+        print("  {kinds[i]}: {kind_counts[i]}")
+        i += 1
+    }
+    print("by the root's own signature algorithm:")
+    i = 0
+    while i < sigs.len() {
+        print("  {sigs[i]}: {sig_counts[i]}")
+        i += 1
+    }
+}

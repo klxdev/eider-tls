@@ -86,9 +86,9 @@ fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.Serv
     if ch.sigalgs.len() == 0 { return Err(alert.protocol(alert.MissingExtension, "no signature_algorithms")) }
     if ch.groups.len() == 0 { return Err(alert.protocol(alert.MissingExtension, "no supported_groups")) }
     let key = cfg.identity.key
-    let scheme = kex.scheme_of(key)
-    if !contains_u32(ch.sigalgs, scheme) {
-        return Err(alert.protocol(alert.HandshakeFailure, "no signature algorithm in common"))
+    let scheme = match kex.pick_scheme(key, ch.sigalgs) {
+        Some(x) => x
+        None => return Err(alert.protocol(alert.HandshakeFailure, "no signature algorithm in common"))
     }
     // cipher suite: the server's order of preference
     let mut chosen_opt: Option[suite.Suite] = None
@@ -237,9 +237,7 @@ fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.Serv
             client_roots = roots
         }
     }
-    let mut client_sigalgs: List[u32] = List.new()
-    client_sigalgs.push(handshake.SIG_ED25519)
-    client_sigalgs.push(handshake.SIG_ECDSA_SECP256R1_SHA256)
+    let client_sigalgs = kex.sigalgs()
     if want_client_cert {
         let cr = handshake.certificate_request(List.new(), client_sigalgs)
         keys.add(inout tr, cr)
@@ -252,7 +250,7 @@ fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.Serv
         Ok(x) => x
         Err(e) => return Err(conn.cfail(e))
     }
-    let sig = match kex.sign(key, keys.cert_verify_content(true, th_cert)) {
+    let sig = match kex.sign(key, scheme, keys.cert_verify_content(true, th_cert)) {
         Ok(x) => x
         Err(e) => return Err(conn.cfail(e))
     }
@@ -326,7 +324,7 @@ fn run[S: stream.Reader + stream.Writer](inout c: conn.Conn[S], cfg: config.Serv
                 Some(x) => x
                 None => return Err(alert.protocol(alert.DecodeError, "malformed CertificateVerify"))
             }
-            if !contains_u32(client_sigalgs, cvm.alg) {
+            if !contains_u32(client_sigalgs, cvm.alg) || !kex.handshake_scheme(cvm.alg) {
                 return Err(alert.protocol(alert.IllegalParameter, "CertificateVerify uses a signature algorithm we did not offer"))
             }
             let th = match keys.hash(tr) {

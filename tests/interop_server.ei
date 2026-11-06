@@ -68,6 +68,7 @@ fn main() uses io, fs, net, clock {
             cfg.groups = List.new()
             if g == String.from("x25519") { cfg.groups.push(handshake.GROUP_X25519) }
             if g == String.from("p256") { cfg.groups.push(handshake.GROUP_SECP256R1) }
+            if g == String.from("p384") { cfg.groups.push(handshake.GROUP_SECP384R1) }
         }
         None => {}
     }

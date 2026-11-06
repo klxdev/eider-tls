@@ -7,7 +7,7 @@ HKDF) come from eider-lang's `crypto` package over an audited libcrypto (AWS-LC 
 the parsers, where memory-safety bugs live in other TLS libraries, are Eider (eider-lang issue 29).
 
 Status: version 0.7.0, the first release. It interoperates with OpenSSL 3.5 in both directions (below). It has
-had no outside review or audit, it does not verify RSA, and it is not yet used by eider-http (docs/http-integration.md
+had no outside review or audit, and it is not yet used by eider-http (docs/http-integration.md
 says how it will be). Read "Not done" before relying on it.
 
 ## Using it
@@ -65,8 +65,8 @@ way to forget to verify the host name.
 |---|---|
 | Versions | TLS 1.3 only. A peer that offers nothing newer than 1.2 gets protocol_version. |
 | Cipher suites | TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256 |
-| Key exchange | X25519 and secp256r1; HelloRetryRequest both ways (client and server) |
-| Signatures | ed25519 and ecdsa_secp256r1_sha256, for the handshake and for certificates (client and server) |
+| Key exchange | X25519, secp256r1 and secp384r1; HelloRetryRequest both ways (client and server) |
+| Signatures | ed25519, ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256/384/512 for the handshake; the same plus rsa_pkcs1_sha256/384/512 for certificates (client and server) |
 | Certificates | X.509 v3 DER and PEM, strict parser (depth and length limits), chain building with backtracking, validity, basicConstraints, keyUsage, pathLen, extendedKeyUsage, unknown critical extensions refused, host names (SAN dNSName with `*` as the whole left label, SAN iPAddress; no CN fallback), trust stores from PEM or the system bundle |
 | Extensions | server_name, ALPN, supported_groups, signature_algorithms, supported_versions, key_share, cookie (echoed) |
 | Client authentication | the server can request or require a certificate (chain checked against a CA list); the client sends one if asked |
@@ -120,14 +120,19 @@ way to forget to verify the host name.
 
 ## Not done
 
-- **RSA.** The crypto package has no RSA, so `rsa_pss_rsae_sha256`, `rsa_pkcs1_*` and RSA keys in certificates
-  cannot be verified or offered. This limits interop with the real world: of the 121 roots in this machine's CA
-  bundle, 118 are RSA or P-384, and most public servers present RSA or P-384 certificates and answer a ClientHello
-  that lists only ed25519 and ecdsa_secp256r1_sha256 with handshake_failure. It works against servers with an
-  Ed25519 or P-256 certificate under a root of those kinds (the 3 P-256 roots of the bundle, a private CA).
-- **Other curves and hashes**: secp384r1, secp521r1, X448, ffdhe, ML-KEM hybrids; ECDSA over SHA-384/512
-  (including P-256 certificates signed by a CA with `ecdsa-with-SHA384`: reported as "unsupported", not
-  as a bad signature).
+- **RSA and P-384, what is covered.** Signature schemes `rsa_pss_rsae_sha256/384/512` (CertificateVerify and
+  certificates), `rsa_pkcs1_sha256/384/512` (certificates only, as RFC 8446 4.2.3 says: never in CertificateVerify)
+  and `ecdsa_secp384r1_sha384`; group secp384r1; X.509 chains signed with sha256/384/512WithRSAEncryption,
+  RSASSA-PSS (SHA-2 with MGF1 of the same hash) and ecdsa-with-SHA256/384/512 over P-256 and P-384; RSA keys of
+  2048 to 8192 bits and P-384 keys, in certificates and as server and client keys (PKCS#8, PKCS#1 "RSA PRIVATE KEY",
+  SEC1). The system CA bundle of this machine: 117 of its 121 roots now verify as trust anchors (key supported and
+  own signature checked), by key RSA-4096 59, P-384 37, RSA-2048 21, P-256 3 (one root, P-521, is not usable);
+  by signature algorithm rsa-pkcs1-SHA256 53, ecdsa-SHA384 34, rsa-pkcs1-SHA384 20, ecdsa-SHA256 6,
+  rsa-pkcs1-SHA512 4, ecdsa-SHA512 1. Before, 3 of 121 were usable. `tests/roots_survey.ei` prints this.
+- **Not supported in signatures and keys**: SHA-1 signatures (`sha1WithRSAEncryption`: the 3 remaining roots, and
+  the old GoDaddy/ValiCert chains), RSA keys under 2048 bits, RSASSA-PSS-OID keys (`rsa_pss_pss_*` schemes), PSS
+  with an MGF1 hash different from the signature hash, RSA key generation, secp521r1 (so the one P-521 root).
+- **Other curves**: secp521r1, X448, ffdhe, ML-KEM hybrids.
 - **Resumption and early data**: no PSK, no session tickets (a NewSessionTicket is parsed and dropped, the client
   offers no PSK, the server issues none), no 0-RTT (a server that receives early_data without a PSK ignores it; no
   early data is ever accepted or sent), no HelloRetryRequest cookies from the server (a client echoes one).

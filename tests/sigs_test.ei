@@ -1,0 +1,289 @@
+// RSA, P-384 and SHA-384/512 in certificates and in CertificateVerify: chains made by the system
+// openssl (tests/pki-rsa.sh: RSA-3072 and RSA-2048 CAs, P-384 and P-256 CAs, signatures with
+// sha256/384/512WithRSAEncryption, RSASSA-PSS and ecdsa-with-SHA256/384/512), the key files in
+// PKCS#8, PKCS#1 and SEC1, the key exchange group secp384r1, and the handshake signature
+// schemes of RFC 8446 section 4.2.3. `now` is fixed so the result does not depend on the date.
+
+import std.bytes
+import std.fs
+import std.io
+import crypto
+import tls.asn1
+import tls.handshake
+import tls.kex
+import tls.keyfile
+import tls.pem
+import tls.x509
+
+fn load(name: str) -> List[u8] uses fs, io {
+    let mut p = "tests/pki/".bytes()
+    bytes.append(inout p, name.bytes())
+    match fs.read(p) {
+        Ok(b) => b
+        Err(e) => {
+            print("cannot read {name}: {e}")
+            List.new()
+        }
+    }
+}
+
+fn certs(name: str) -> List[x509.Cert] uses fs, io {
+    let mut out: List[x509.Cert] = List.new()
+    match pem.decode_all(load(name)) {
+        Ok(blocks) => {
+            for b in blocks {
+                match x509.parse(b.der) {
+                    Ok(c) => out.push(c)
+                    Err(e) => print("parse {name}: {e}")
+                }
+            }
+        }
+        Err(e) => print("pem {name}: {e}")
+    }
+    out
+}
+
+fn store_of(name: str) -> x509.Store uses fs, io {
+    let mut s = x509.empty_store()
+    for c in certs(name) { s.roots.push(c) }
+    s
+}
+
+fn host(s: str) -> Option[List[u8]] { Some(s.bytes()) }
+
+fn show(label: str, r: Result[x509.Cert, x509.Failure]) uses io {
+    match r {
+        Ok(a) => print("{label}: ok")
+        Err(f) => print("{label}: {f.detail}")
+    }
+}
+
+fn scheme_text(s: x509.SigScheme) -> String {
+    match s {
+        x509.SigEd25519 => String.from("ed25519")
+        x509.SigEcdsa(h) => "ecdsa {h}"
+        x509.SigRsaPkcs1(h) => "rsa-pkcs1 {h}"
+        x509.SigRsaPss(h, salt) => "rsa-pss {h} salt {salt}"
+        x509.SigUnsupported => String.from("unsupported")
+    }
+}
+
+fn chain(label: str, file: str, roots: str, now: i64) uses io, fs {
+    show(label, x509.verify_chain(certs(file), store_of(roots), now, x509.ServerAuth, host("localhost")))
+}
+
+fn key(name: str) -> keyfile.SigningKey uses io, fs {
+    match keyfile.from_pem(load(name)) {
+        Ok(k) => k
+        Err(e) => {
+            print("key {name}: {e}")
+            panic("sigs_test: key")
+        }
+    }
+}
+
+// sign with every scheme the key has, verify under the certificate, and check what must fail
+fn handshake_sigs(label: str, cert_file: str, key_file: str) uses io, fs {
+    let cert = certs(cert_file)[0].copy()
+    let k = key(key_file)
+    let content = "TLS 1.3, server CertificateVerify".bytes()
+    let own = kex.schemes_of(k)
+    let mut line = "{label}: schemes {own.len()}"
+    for alg in own {
+        match kex.sign(k, alg, content.copy()) {
+            Ok(sig) => {
+                let good = kex.verify(cert, alg, content.copy(), sig.copy())
+                let mut bad = sig.copy()
+                bad[bad.len() - 1] = bad[bad.len() - 1] ^ 1
+                let tampered = kex.verify(cert, alg, content.copy(), bad)
+                let other_content = kex.verify(cert, alg, "another message".bytes(), sig.copy())
+                line = "{line} {alg}:{good}/{tampered}/{other_content}"
+            }
+            Err(_) => { line = "{line} {alg}:sign failed" }
+        }
+    }
+    print(line)
+}
+
+fn main() uses io, fs {
+    // 2026-11-08 12:00:00 UTC (the fixtures are valid from 2026-11-06 for ten years)
+    let now = asn1.days_from_civil(2026, 11, 8) * 86400 + 43200
+
+    print("== signature algorithms of the fixtures")
+    for f in ["rsa2048.pem", "rsa-inter.pem", "rsa3072.pem", "rsa-sha512.pem", "rsa-pss.pem", "rsa-pss384.pem", "p384.pem", "p256-by-p384.pem", "p256-sha512.pem", "p384-by-p256.pem", "rsa-pss-mgf1sha1.pem", "rsa-root.pem", "p384-root.pem", "ec.pem", "ed.pem", "sha384sig.pem", "rsasigned.pem"] {
+        let c = certs(f)[0].copy()
+        print("{f}: key {c.key_kind}, signed with {scheme_text(x509.sig_scheme(c))}")
+    }
+
+    print("== chains")
+    chain("rsa-2048 leaf via RSA intermediate to an RSA-3072 root", "rsa2048chain.pem", "rsa-root.pem", now)
+    chain("rsa-3072 leaf, sha384WithRSAEncryption", "rsa3072.pem", "rsa-root.pem", now)
+    chain("rsa-2048 leaf, sha512WithRSAEncryption", "rsa-sha512.pem", "rsa-root.pem", now)
+    chain("rsa-2048 leaf, RSASSA-PSS sha256", "rsa-pss.pem", "rsa-root.pem", now)
+    chain("rsa-2048 leaf, RSASSA-PSS sha384 salt 48", "rsa-pss384.pem", "rsa-root.pem", now)
+    chain("p384 leaf, ecdsa-with-SHA384", "p384.pem", "p384-root.pem", now)
+    chain("p256 leaf under a P-384 root, ecdsa-with-SHA384", "p256-by-p384.pem", "p384-root.pem", now)
+    chain("p256 leaf under a P-384 root, ecdsa-with-SHA512", "p256-sha512.pem", "p384-root.pem", now)
+    chain("p384 leaf under a P-256 root, ecdsa-with-SHA256", "p384-by-p256.pem", "p256-root.pem", now)
+    chain("rsa leaf, wrong root (P-384)", "rsa3072.pem", "p384-root.pem", now)
+    chain("rsa leaf, the RSA root is not in the store", "rsa3072.pem", "root.pem", now)
+    chain("p384 leaf, root of another family", "p384.pem", "rsa-root.pem", now)
+    chain("RSASSA-PSS with SHA-256 and MGF1 with SHA-1", "rsa-pss-mgf1sha1.pem", "rsa-root.pem", now)
+    chain("the older sha384 fixture, signed by a CA that is not in the store", "sha384sig.pem", "root.pem", now)
+    chain("a chain through a 1024-bit RSA root", "rsa1024-leaf.pem", "rsa1024-root.pem", now)
+    show("rsa2048 leaf alone (no intermediate)", x509.verify_chain(certs("rsa2048.pem"), store_of("rsa-root.pem"), now, x509.ServerAuth, host("localhost")))
+    show("rsa2048 chain, wrong name", x509.verify_chain(certs("rsa2048chain.pem"), store_of("rsa-root.pem"), now, x509.ServerAuth, host("example.org")))
+    show("rsa client certificate as client", x509.verify_chain(certs("rsa-client.pem"), store_of("rsa-root.pem"), now, x509.ClientAuth, None))
+    show("p384 client certificate as client", x509.verify_chain(certs("p384-client.pem"), store_of("p384-root.pem"), now, x509.ClientAuth, None))
+
+    print("== tampering")
+    let rs = certs("rsa2048chain.pem")
+    let rroot = store_of("rsa-root.pem")
+    let mut t1 = rs[0].copy()
+    t1.sig[t1.sig.len() - 1] = t1.sig[t1.sig.len() - 1] ^ 1
+    show("rsa leaf: last byte of the signature", x509.verify_chain(l2(t1, rs[1].copy()), rroot, now, x509.ServerAuth, host("localhost")))
+    let mut t2 = rs[0].copy()
+    t2.sig[0] = t2.sig[0] ^ 128
+    show("rsa leaf: first byte of the signature", x509.verify_chain(l2(t2, rs[1].copy()), rroot, now, x509.ServerAuth, host("localhost")))
+    let mut t3 = rs[0].copy()
+    t3.sig = bytes.slice(t3.sig, 0, t3.sig.len() - 1)
+    show("rsa leaf: signature one byte short", x509.verify_chain(l2(t3, rs[1].copy()), rroot, now, x509.ServerAuth, host("localhost")))
+    let mut t4 = rs[0].copy()
+    t4.tbs[t4.tbs.len() - 1] = t4.tbs[t4.tbs.len() - 1] ^ 1
+    show("rsa leaf: the signed bytes", x509.verify_chain(l2(t4, rs[1].copy()), rroot, now, x509.ServerAuth, host("localhost")))
+    let ps = certs("rsa-pss.pem")[0].copy()
+    let mut t5 = ps.copy()
+    t5.sig[10] = t5.sig[10] ^ 1
+    show("rsa-pss leaf: a byte of the signature", x509.verify_chain(l1(t5), rroot, now, x509.ServerAuth, host("localhost")))
+    let pe = certs("p384.pem")[0].copy()
+    let mut t6 = pe.copy()
+    t6.sig[t6.sig.len() - 1] = t6.sig[t6.sig.len() - 1] ^ 1
+    show("p384 leaf: the signature", x509.verify_chain(l1(t6), store_of("p384-root.pem"), now, x509.ServerAuth, host("localhost")))
+    let mut t7 = pe.copy()
+    t7.tbs[40] = t7.tbs[40] ^ 1
+    show("p384 leaf: the signed bytes", x509.verify_chain(l1(t7), store_of("p384-root.pem"), now, x509.ServerAuth, host("localhost")))
+    // a signature algorithm changed after signing: sha256 where sha384 was used
+    let sw = certs("rsa3072.pem")[0].copy()
+    show("sha384 signature checked as sha384 (control)", x509.verify_chain(l1(sw), rroot, now, x509.ServerAuth, host("localhost")))
+    print("signed_by: leaf by intermediate {x509.signed_by(rs[0].copy(), rs[1].copy())}, intermediate by leaf {x509.signed_by(rs[1].copy(), rs[0].copy())}, leaf by the root {x509.signed_by(rs[0].copy(), rroot.roots[0].copy())}")
+
+    print("== the handshake signature schemes")
+    handshake_sigs("rsa-2048", "rsa2048.pem", "rsa2048.key")
+    handshake_sigs("rsa-2048 from PKCS#1", "rsa2048.pem", "rsa2048.pkcs1.key")
+    handshake_sigs("rsa-3072", "rsa3072.pem", "rsa3072.key")
+    handshake_sigs("p384", "p384.pem", "p384.key")
+    handshake_sigs("p384 from SEC1", "p384.pem", "p384.sec1.key")
+    handshake_sigs("p256 (pkcs8)", "p256-by-p384.pem", "p256-by-p384.key")
+    handshake_sigs("p256 from SEC1", "p256-by-p384.pem", "p256-by-p384.sec1.key")
+    handshake_sigs("ed25519", "ed.pem", "ed.key")
+    // a certificate whose key does not fit the scheme, and the PKCS#1 schemes in CertificateVerify
+    let rsa_cert = certs("rsa2048.pem")[0].copy()
+    let rsa_key = key("rsa2048.key")
+    let msg = "content".bytes()
+    let pss = kex.sign(rsa_key, handshake.SIG_RSA_PSS_RSAE_SHA256, msg.copy()).unwrap()
+    let cert3072 = certs("rsa3072.pem")[0].copy()
+    let cert_ed = certs("ed.pem")[0].copy()
+    let cert_p256 = certs("p256-by-p384.pem")[0].copy()
+    let cert_p384 = certs("p384.pem")[0].copy()
+    let v_own = kex.verify(rsa_cert.copy(), handshake.SIG_RSA_PSS_RSAE_SHA256, msg.copy(), pss.copy())
+    let v_384 = kex.verify(rsa_cert.copy(), handshake.SIG_RSA_PSS_RSAE_SHA384, msg.copy(), pss.copy())
+    let v_512 = kex.verify(rsa_cert.copy(), handshake.SIG_RSA_PSS_RSAE_SHA512, msg.copy(), pss.copy())
+    let v_p256 = kex.verify(rsa_cert.copy(), handshake.SIG_ECDSA_SECP256R1_SHA256, msg.copy(), pss.copy())
+    let v_p384 = kex.verify(rsa_cert.copy(), handshake.SIG_ECDSA_SECP384R1_SHA384, msg.copy(), pss.copy())
+    let v_ed = kex.verify(rsa_cert.copy(), handshake.SIG_ED25519, msg.copy(), pss.copy())
+    let v_other = kex.verify(cert3072, handshake.SIG_RSA_PSS_RSAE_SHA256, msg.copy(), pss.copy())
+    print("rsa-pss signature under: its own cert {v_own}, as sha384 {v_384}, as sha512 {v_512}, as ecdsa p256 {v_p256}, as ecdsa p384 {v_p384}, as ed25519 {v_ed}, another RSA cert {v_other}")
+    let rsa_priv = match rsa_key {
+        keyfile.RsaSigKey(k) => k
+        _ => panic("not rsa")
+    }
+    let p1 = crypto.rsa_pkcs1_sign(rsa_priv, crypto.Sha256, msg.copy()).unwrap()
+    let v_pkcs1 = kex.verify(rsa_cert.copy(), handshake.SIG_RSA_PKCS1_SHA256, msg.copy(), p1.bytes.copy())
+    let allowed = kex.handshake_scheme(handshake.SIG_RSA_PKCS1_SHA256)
+    print("rsa-pkcs1 signature as CertificateVerify: {v_pkcs1}, and the scheme is allowed in a handshake: {allowed}")
+    let v_ed_rsa = kex.verify(cert_ed, handshake.SIG_RSA_PSS_RSAE_SHA256, msg.copy(), pss.copy())
+    print("an rsa-pss signature under an Ed25519 certificate: {v_ed_rsa}")
+    let ec384 = key("p384.key")
+    let s384 = kex.sign(ec384, handshake.SIG_ECDSA_SECP384R1_SHA384, msg.copy()).unwrap()
+    let v_on_p256 = kex.verify(cert_p256, handshake.SIG_ECDSA_SECP384R1_SHA384, msg.copy(), s384.copy())
+    let v_as_p256 = kex.verify(cert_p384, handshake.SIG_ECDSA_SECP256R1_SHA256, msg.copy(), s384.copy())
+    print("p384 signature: with a P-256 certificate {v_on_p256}, as ecdsa_secp256r1_sha256 {v_as_p256}")
+    let e1 = kex.sign(rsa_key, handshake.SIG_ECDSA_SECP256R1_SHA256, msg.copy()).is_err()
+    let e2 = kex.sign(ec384, handshake.SIG_ECDSA_SECP256R1_SHA256, msg.copy()).is_err()
+    let e3 = kex.sign(rsa_key, handshake.SIG_RSA_PKCS1_SHA256, msg.copy()).is_err()
+    print("sign with a scheme the key does not have: rsa key / ecdsa {e1}, p384 key / ecdsa p256 {e2}, rsa key / pkcs1 {e3}")
+    // which scheme is picked
+    let peer_all = kex.sigalgs()
+    let mut peer_p256_only: List[u32] = List.new()
+    peer_p256_only.push(handshake.SIG_ECDSA_SECP256R1_SHA256)
+    let mut peer_sha512_only: List[u32] = List.new()
+    peer_sha512_only.push(handshake.SIG_RSA_PSS_RSAE_SHA512)
+    peer_sha512_only.push(handshake.SIG_RSA_PKCS1_SHA256)
+    let pk1 = kex.pick_scheme(rsa_key, peer_all.copy())
+    let pk2 = kex.pick_scheme(rsa_key, peer_sha512_only.copy())
+    let pk3 = kex.pick_scheme(rsa_key, peer_p256_only.copy())
+    let pk4 = kex.pick_scheme(ec384, peer_all.copy())
+    let pk5 = kex.pick_scheme(ec384, peer_p256_only.copy())
+    print("picked: rsa/all {pk1}, rsa/sha512 only {pk2}, rsa/p256 only {pk3}, p384/all {pk4}, p384/p256 only {pk5}")
+
+    print("== key files")
+    for f in ["rsa2048.key", "rsa2048.pkcs1.key", "rsa3072.key", "p384.key", "p384.sec1.key", "p256-by-p384.key", "p256-by-p384.sec1.key", "ed.key", "client.key"] {
+        match keyfile.from_pem(load(f)) {
+            Ok(k) => {
+                let what = match k {
+                    keyfile.EdKey(_) => "ed25519"
+                    keyfile.EcKey(s) => if s.curve == crypto.P384 { "ec p384" } else { "ec p256" }
+                    keyfile.RsaSigKey(r) => if crypto.rsa_bits(crypto.rsa_public_of(r)) == 3072 { "rsa 3072" } else { "rsa 2048" }
+                }
+                print("{f}: {what}")
+            }
+            Err(e) => print("{f}: {e}")
+        }
+    }
+    // a certificate file is not a key, and a key with trailing junk is no key
+    match keyfile.from_pem(load("rsa2048.pem")) {
+        Ok(_) => print("a certificate read as a key: accepted")
+        Err(e) => print("a certificate read as a key: {e}")
+    }
+    let blocks = pem.decode_all(load("rsa2048.key")).unwrap()
+    let mut junk = blocks[0].der.copy()
+    junk.push(0)
+    match keyfile.from_pkcs8(junk) {
+        Ok(_) => print("pkcs8 with a trailing byte: accepted")
+        Err(e) => print("pkcs8 with a trailing byte: {e}")
+    }
+    let short = bytes.slice(blocks[0].der, 0, blocks[0].der.len() - 10)
+    match keyfile.from_pkcs8(short) {
+        Ok(_) => print("truncated pkcs8: accepted")
+        Err(e) => print("truncated pkcs8: {e}")
+    }
+
+    print("== key exchange")
+    for g in [handshake.GROUP_X25519, handshake.GROUP_SECP256R1, handshake.GROUP_SECP384R1] {
+        let a = kex.generate(g).unwrap()
+        let b = kex.generate(g).unwrap()
+        let ab = kex.agree(a, kex.share_of(b)).unwrap()
+        let ba = kex.agree(b, kex.share_of(a)).unwrap()
+        print("group {g}: supported {kex.supported(g)}, share {kex.share_of(a).len()} bytes, valid {kex.valid_share(g, kex.share_of(a))}, agree {bytes.eq(ab, ba)}, secret {ab.len()} bytes")
+    }
+    let k384 = kex.generate(handshake.GROUP_SECP384R1).unwrap()
+    let mut off = kex.share_of(kex.generate(handshake.GROUP_SECP384R1).unwrap())
+    off[96] = off[96] ^ 1
+    print("secp384r1 share off the curve: {kex.agree(k384, off).is_err()}")
+    let short_share = bytes.slice(kex.share_of(k384), 0, 65)
+    let mut compressed = kex.share_of(k384)
+    compressed[0] = 2
+    print("secp384r1 share of 65 bytes valid: {kex.valid_share(handshake.GROUP_SECP384R1, short_share)}; of 97 bytes starting 0x02: {kex.valid_share(handshake.GROUP_SECP384R1, compressed)}")
+}
+
+fn l1(a: x509.Cert) -> List[x509.Cert] {
+    let mut out: List[x509.Cert] = List.new()
+    out.push(a)
+    out
+}
+
+fn l2(a: x509.Cert, b: x509.Cert) -> List[x509.Cert] {
+    let mut out = l1(a)
+    out.push(b)
+    out
+}

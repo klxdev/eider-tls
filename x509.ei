@@ -1,5 +1,7 @@
 //! tls.x509: X.509 v3 certificates (RFC 5280): a strict DER parser, signature checks with
-//! Ed25519 and ECDSA P-256 / SHA-256, hostname matching (RFC 6125: SAN dNSName with a
+//! Ed25519, ECDSA (P-256 and P-384 keys; SHA-256, SHA-384 or SHA-512), RSASSA-PKCS1-v1_5
+//! (sha256/384/512WithRSAEncryption) and RSASSA-PSS (SHA-2, MGF1 of the same hash; keys of
+//! 2048 to 8192 bits, the crypto package's key policy), hostname matching (RFC 6125: SAN dNSName with a
 //! leftmost-label wildcard, SAN iPAddress; the subject CN is not used), and chain building
 //! and validation against a trust store.
 //!
@@ -18,7 +20,7 @@ import tls.asn1
 import tls.pem
 import tls.wire
 
-pub type KeyKind = | Ed25519Key | P256Key | OtherKey
+pub type KeyKind = | Ed25519Key | P256Key | P384Key | RsaKey | OtherKey
 
 /// A parsed certificate. `problem` is set when it carries something this package refuses to
 /// validate (an unknown critical extension, name constraints); parsing still succeeds so a
@@ -35,7 +37,10 @@ pub type Cert = {
     not_before: i64,
     not_after: i64,
     key_kind: KeyKind,
+    /// The subjectPublicKey bits: the raw key (Ed25519), the uncompressed point (EC), the DER RSAPublicKey.
     key: List[u8],
+    /// The whole SubjectPublicKeyInfo, DER.
+    spki: List[u8],
     has_bc: bool,
     is_ca: bool,
     path_len: Option[u32],
@@ -58,7 +63,19 @@ pub const KU_KEY_CERT_SIGN: u32 = 1024
 fn oid_ec_public_key() -> List[u8] { wire.hex("2a8648ce3d0201") }
 fn oid_prime256v1() -> List[u8] { wire.hex("2a8648ce3d030107") }
 fn oid_ed25519() -> List[u8] { wire.hex("2b6570") }
+fn oid_secp384r1() -> List[u8] { wire.hex("2b81040022") }
+fn oid_rsa_encryption() -> List[u8] { wire.hex("2a864886f70d010101") }
 fn oid_ecdsa_sha256() -> List[u8] { wire.hex("2a8648ce3d040302") }
+fn oid_ecdsa_sha384() -> List[u8] { wire.hex("2a8648ce3d040303") }
+fn oid_ecdsa_sha512() -> List[u8] { wire.hex("2a8648ce3d040304") }
+fn oid_rsa_sha256() -> List[u8] { wire.hex("2a864886f70d01010b") }
+fn oid_rsa_sha384() -> List[u8] { wire.hex("2a864886f70d01010c") }
+fn oid_rsa_sha512() -> List[u8] { wire.hex("2a864886f70d01010d") }
+fn oid_rsassa_pss() -> List[u8] { wire.hex("2a864886f70d01010a") }
+fn oid_mgf1() -> List[u8] { wire.hex("2a864886f70d010108") }
+fn oid_sha256() -> List[u8] { wire.hex("608648016503040201") }
+fn oid_sha384() -> List[u8] { wire.hex("608648016503040202") }
+fn oid_sha512() -> List[u8] { wire.hex("608648016503040203") }
 fn oid_basic_constraints() -> List[u8] { wire.hex("551d13") }
 fn oid_key_usage() -> List[u8] { wire.hex("551d0f") }
 fn oid_san() -> List[u8] { wire.hex("551d11") }
@@ -286,8 +303,18 @@ fn parse_opt(der: List[u8]) -> Option[Cert] {
                 if asn1.is_oid(top, curve, oid_prime256v1()) {
                     if key.len() != 65 || key[0] != 4 { return None }
                     key_kind = P256Key
+                } else if asn1.is_oid(top, curve, oid_secp384r1()) {
+                    if key.len() != 97 || key[0] != 4 { return None }
+                    key_kind = P384Key
                 }
             }
+            None => {}
+        }
+    } else if asn1.is_oid(top, alg_oid, oid_rsa_encryption()) {
+        // rsaEncryption with NULL parameters (RFC 8017 A.1); whether the key is usable (its size) is the
+        // crypto package's to say when it is used
+        match asn1.expect(inout ar, asn1.NULL) {
+            Some(_) => { if asn1.done(ar) { key_kind = RsaKey } }
             None => {}
         }
     }
@@ -311,7 +338,7 @@ fn parse_opt(der: List[u8]) -> Option[Cert] {
     if !asn1.done(t) { return None }
     Some(Cert(
         der, asn1.raw(top, tbs), asn1.raw(top, sig_alg), sig, version, serial,
-        asn1.raw(top, issuer_t), asn1.raw(top, subject_t), nb, na, key_kind, key,
+        asn1.raw(top, issuer_t), asn1.raw(top, subject_t), nb, na, key_kind, key, asn1.raw(top, spki),
         x.has_bc, x.is_ca, x.path_len, x.key_usage, x.eku_present, x.eku_server, x.eku_client,
         x.has_san, x.dns, x.ips, x.ski, x.aki, x.problem
     ))
@@ -319,7 +346,81 @@ fn parse_opt(der: List[u8]) -> Option[Cert] {
 
 // ------------------------------------------------------------------ signatures
 
-pub type SigScheme = | SigEd25519 | SigEcdsaSha256 | SigUnsupported
+/// How a signature was made. `SigRsaPss`: the hash (also the MGF1 hash) and the salt length.
+pub type SigScheme =
+    | SigEd25519
+    | SigEcdsa(hash: crypto.Hash)
+    | SigRsaPkcs1(hash: crypto.Hash)
+    | SigRsaPss(hash: crypto.Hash, salt: usize)
+    | SigUnsupported
+
+pub fn is_unsupported(s: SigScheme) -> bool {
+    match s {
+        SigUnsupported => true
+        _ => false
+    }
+}
+
+// the hash of an AlgorithmIdentifier { sha256 | sha384 | sha512, NULL or absent }
+fn hash_alg(d: asn1.Dr, t: asn1.Tlv) -> Option[crypto.Hash] {
+    let mut r = asn1.into(d, t)
+    let oid = asn1.expect(inout r, asn1.OID)?
+    match asn1.expect(inout r, asn1.NULL) {
+        Some(_) => {}
+        None => {}
+    }
+    if !asn1.done(r) { return None }
+    if asn1.is_oid(d, oid, oid_sha256()) { return Some(crypto.Sha256) }
+    if asn1.is_oid(d, oid, oid_sha384()) { return Some(crypto.Sha384) }
+    if asn1.is_oid(d, oid, oid_sha512()) { return Some(crypto.Sha512) }
+    None
+}
+
+// RSASSA-PSS-params (RFC 4055 3.1): [0] hashAlgorithm, [1] maskGenAlgorithm, [2] saltLength, [3]
+// trailerField; the defaults are SHA-1 and a salt of 20, and SHA-1 is not supported, so the hash and
+// the MGF1 hash must be there and equal. The salt may be 0 to 1024 bytes; the trailer, when there, 1.
+fn pss_params(d: asn1.Dr, t: asn1.Tlv) -> Option[SigScheme] {
+    let mut p = asn1.into(d, t)
+    let h0 = asn1.expect(inout p, asn1.explicit(0))?
+    let mut hr = asn1.into(d, h0)
+    let hseq = asn1.expect(inout hr, asn1.SEQUENCE)?
+    if !asn1.done(hr) { return None }
+    let h = hash_alg(d, hseq)?
+    let m1 = asn1.expect(inout p, asn1.explicit(1))?
+    let mut mr = asn1.into(d, m1)
+    let mseq = asn1.expect(inout mr, asn1.SEQUENCE)?
+    if !asn1.done(mr) { return None }
+    let mut ms = asn1.into(d, mseq)
+    let moid = asn1.expect(inout ms, asn1.OID)?
+    if !asn1.is_oid(d, moid, oid_mgf1()) { return None }
+    let mh = asn1.expect(inout ms, asn1.SEQUENCE)?
+    if !asn1.done(ms) { return None }
+    let mgf_hash = hash_alg(d, mh)?
+    if mgf_hash != h { return None }
+    let mut salt: usize = 20
+    match asn1.expect(inout p, asn1.explicit(2)) {
+        Some(sx) => {
+            let mut sr = asn1.into(d, sx)
+            let si = asn1.expect(inout sr, asn1.INTEGER)?
+            if !asn1.done(sr) { return None }
+            let v = asn1.small_uint(d, si)?
+            if v > 1024 { return None }
+            salt = v as usize
+        }
+        None => {}
+    }
+    match asn1.expect(inout p, asn1.explicit(3)) {
+        Some(tx) => {
+            let mut tr = asn1.into(d, tx)
+            let ti = asn1.expect(inout tr, asn1.INTEGER)?
+            if !asn1.done(tr) { return None }
+            if asn1.small_uint(d, ti)? != 1 { return None }
+        }
+        None => {}
+    }
+    if !asn1.done(p) { return None }
+    Some(SigRsaPss(h, salt))
+}
 
 /// The signature algorithm `c` was signed with.
 pub fn sig_scheme(c: Cert) -> SigScheme {
@@ -333,47 +434,138 @@ pub fn sig_scheme(c: Cert) -> SigScheme {
         Some(o) => o
         None => return SigUnsupported
     }
-    // both algorithms have absent parameters (RFC 8410, RFC 5758)
+    // Ed25519 and ECDSA have absent parameters (RFC 8410, RFC 5758); RSA PKCS#1 has NULL (RFC 4055
+    // section 5); RSASSA-PSS has its parameters (RFC 4055 section 3.1)
+    if asn1.is_oid(d, oid, oid_rsassa_pss()) {
+        match asn1.expect(inout r, asn1.SEQUENCE) {
+            Some(ps) => {
+                if !asn1.done(r) { return SigUnsupported }
+                match pss_params(d, ps) {
+                    Some(s) => return s
+                    None => return SigUnsupported
+                }
+            }
+            None => return SigUnsupported
+        }
+    }
+    let is_rsa = asn1.is_oid(d, oid, oid_rsa_sha256()) || asn1.is_oid(d, oid, oid_rsa_sha384()) || asn1.is_oid(d, oid, oid_rsa_sha512())
+    if is_rsa {
+        match asn1.expect(inout r, asn1.NULL) {
+            Some(_) => {}
+            None => return SigUnsupported
+        }
+    }
     if !asn1.done(r) { return SigUnsupported }
     if asn1.is_oid(d, oid, oid_ed25519()) { return SigEd25519 }
-    if asn1.is_oid(d, oid, oid_ecdsa_sha256()) { return SigEcdsaSha256 }
+    if asn1.is_oid(d, oid, oid_ecdsa_sha256()) { return SigEcdsa(crypto.Sha256) }
+    if asn1.is_oid(d, oid, oid_ecdsa_sha384()) { return SigEcdsa(crypto.Sha384) }
+    if asn1.is_oid(d, oid, oid_ecdsa_sha512()) { return SigEcdsa(crypto.Sha512) }
+    if asn1.is_oid(d, oid, oid_rsa_sha256()) { return SigRsaPkcs1(crypto.Sha256) }
+    if asn1.is_oid(d, oid, oid_rsa_sha384()) { return SigRsaPkcs1(crypto.Sha384) }
+    if asn1.is_oid(d, oid, oid_rsa_sha512()) { return SigRsaPkcs1(crypto.Sha512) }
     SigUnsupported
 }
 
-/// Does `issuer`'s key verify `c`'s signature over its TBSCertificate?
-pub fn signed_by(c: Cert, issuer: Cert) -> bool {
-    match sig_scheme(c) {
+fn rsa_key_of(k: Cert) -> Option[crypto.RsaPublic] {
+    match k.key_kind {
+        RsaKey => {
+            match crypto.public_key_from_spki(k.spki) {
+                Ok(pk) => {
+                    match pk {
+                        crypto.RsaKey(r) => Some(r)
+                        _ => None
+                    }
+                }
+                Err(_) => None
+            }
+        }
+        _ => None
+    }
+}
+
+/// Why the key of `k` cannot verify a signature made with `s` (a key of another type, an RSA
+/// key outside 2048 to 8192 bits), or None when it can be tried.
+pub fn key_problem(k: Cert, s: SigScheme) -> Option[String] {
+    match s {
         SigEd25519 => {
-            match issuer.key_kind {
+            match k.key_kind {
+                Ed25519Key => None
+                _ => Some(String.from("the issuer's key is not an Ed25519 key"))
+            }
+        }
+        SigEcdsa(_) => {
+            match k.key_kind {
+                P256Key => None
+                P384Key => None
+                _ => Some(String.from("the issuer's key is not an ECDSA key on P-256 or P-384"))
+            }
+        }
+        SigRsaPkcs1(_) => rsa_problem(k)
+        SigRsaPss(_, _) => rsa_problem(k)
+        SigUnsupported => Some(String.from("unsupported signature algorithm"))
+    }
+}
+
+fn rsa_problem(k: Cert) -> Option[String] {
+    match k.key_kind {
+        RsaKey => {
+            if rsa_key_of(k).is_none() { return Some(String.from("the issuer's RSA key is outside 2048 to 8192 bits or otherwise unusable")) }
+            None
+        }
+        _ => Some(String.from("the issuer's key is not an RSA key"))
+    }
+}
+
+/// Does the key of certificate `k` verify `sig` over `msg` made with scheme `s`? (ECDSA: the
+/// hash is the scheme's, the curve the key's; RSA: PKCS#1 v1.5 or PSS with the scheme's hash and salt.)
+pub fn verify_with(k: Cert, s: SigScheme, msg: List[u8], sig: List[u8]) -> bool {
+    match s {
+        SigEd25519 => {
+            match k.key_kind {
                 Ed25519Key => {
-                    let pk = match crypto.ed25519_public_key(issuer.key) {
-                        Ok(k) => k
+                    let pk = match crypto.ed25519_public_key(k.key) {
+                        Ok(x) => x
                         Err(_) => return false
                     }
-                    let sg = match crypto.ed25519_signature(c.sig) {
-                        Ok(s) => s
+                    let sg = match crypto.ed25519_signature(sig) {
+                        Ok(x) => x
                         Err(_) => return false
                     }
-                    crypto.ed25519_verify(pk, c.tbs, sg)
+                    crypto.ed25519_verify(pk, msg, sg)
                 }
                 _ => false
             }
         }
-        SigEcdsaSha256 => {
-            match issuer.key_kind {
-                P256Key => {
-                    let pk = match crypto.p256_public_key(issuer.key) {
-                        Ok(k) => k
-                        Err(_) => return false
-                    }
-                    crypto.p256_verify(pk, c.tbs, crypto.p256_signature_der(c.sig))
-                }
-                _ => false
+        SigEcdsa(h) => {
+            let curve = match k.key_kind {
+                P256Key => crypto.P256
+                P384Key => crypto.P384
+                _ => return false
+            }
+            let pk = match crypto.ec_public_key(curve, k.key) {
+                Ok(x) => x
+                Err(_) => return false
+            }
+            crypto.ec_verify(pk, h, msg, crypto.ec_signature_der(sig))
+        }
+        SigRsaPkcs1(h) => {
+            match rsa_key_of(k) {
+                Some(pk) => crypto.rsa_pkcs1_verify(pk, h, msg, crypto.rsa_signature(sig))
+                None => false
+            }
+        }
+        SigRsaPss(h, salt) => {
+            match rsa_key_of(k) {
+                Some(pk) => crypto.rsa_pss_verify(pk, h, salt, msg, crypto.rsa_signature(sig))
+                None => false
             }
         }
         SigUnsupported => false
     }
 }
+
+/// Does `issuer`'s key verify `c`'s signature over its TBSCertificate?
+pub fn signed_by(c: Cert, issuer: Cert) -> bool { verify_with(issuer, sig_scheme(c), c.tbs, c.sig) }
 
 // ------------------------------------------------------------------ names
 
@@ -680,8 +872,9 @@ fn extend(chain: List[Cert], store: Store, cur: Cert, depth: usize, now: i64, us
     }
     if is_anchor(cur, store) { return Ok(cur) }
     if depth + 1 >= MAX_CHAIN { return Err(fail(TooDeep)) }
-    if sig_scheme(cur) == SigUnsupported {
-        return Err(Failure(Unsupported, String.from("unsupported certificate signature algorithm (only ed25519 and ecdsa-with-SHA256 are verified)")))
+    let scheme = sig_scheme(cur)
+    if is_unsupported(scheme) {
+        return Err(Failure(Unsupported, String.from("unsupported certificate signature algorithm (verified: ed25519, ecdsa-with-SHA256/384/512, sha256/384/512WithRSAEncryption, RSASSA-PSS with SHA-2)")))
     }
     // candidate issuers: the trust anchors first, then the intermediates the peer sent
     let mut best = fail(UnknownIssuer)
@@ -691,7 +884,9 @@ fn extend(chain: List[Cert], store: Store, cur: Cert, depth: usize, now: i64, us
             match can_issue(r, depth, true) {
                 Some(f) => { best = f }
                 None => {
-                    if !signed_by(cur, r) {
+                    if key_problem(r, scheme).is_some() {
+                        best = Failure(Unsupported, key_problem(r, scheme).unwrap())
+                    } else if !signed_by(cur, r) {
                         best = fail(BadSignature)
                     } else {
                         match extend(chain, store, r, depth + 1, now, used) {
@@ -715,7 +910,9 @@ fn extend(chain: List[Cert], store: Store, cur: Cert, depth: usize, now: i64, us
             match can_issue(cand, depth, false) {
                 Some(f) => { best = f }
                 None => {
-                    if !signed_by(cur, cand) {
+                    if key_problem(cand, scheme).is_some() {
+                        best = Failure(Unsupported, key_problem(cand, scheme).unwrap())
+                    } else if !signed_by(cur, cand) {
                         best = fail(BadSignature)
                     } else {
                         let mut u2 = used.copy()

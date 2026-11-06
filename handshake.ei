@@ -30,9 +30,17 @@ pub const EXT_PRE_SHARED_KEY: u32 = 41
 pub const EXT_EARLY_DATA: u32 = 42
 
 pub const GROUP_SECP256R1: u32 = 23
+pub const GROUP_SECP384R1: u32 = 24
 pub const GROUP_X25519: u32 = 29
 
+pub const SIG_RSA_PKCS1_SHA256: u32 = 1025
+pub const SIG_RSA_PKCS1_SHA384: u32 = 1281
+pub const SIG_RSA_PKCS1_SHA512: u32 = 1537
 pub const SIG_ECDSA_SECP256R1_SHA256: u32 = 1027
+pub const SIG_ECDSA_SECP384R1_SHA384: u32 = 1283
+pub const SIG_RSA_PSS_RSAE_SHA256: u32 = 2052
+pub const SIG_RSA_PSS_RSAE_SHA384: u32 = 2053
+pub const SIG_RSA_PSS_RSAE_SHA512: u32 = 2054
 pub const SIG_ED25519: u32 = 2055
 
 pub const TLS13: u32 = 772

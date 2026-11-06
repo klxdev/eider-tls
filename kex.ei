@@ -1,6 +1,7 @@
-//! tls.kex: key exchange groups (X25519 and secp256r1) and the handshake signature schemes
-//! (ed25519 and ecdsa_secp256r1_sha256) over the crypto package. RSA signatures are not
-//! implemented: the crypto package has no RSA.
+//! tls.kex: key exchange groups (X25519, secp256r1 and secp384r1) and the signature schemes
+//! (ed25519, ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256/384/512 for
+//! the handshake; rsa_pkcs1_sha256/384/512 only for certificates, as RFC 8446 section 4.2.3
+//! says) over the crypto package.
 
 import crypto
 import tls.handshake
@@ -11,15 +12,17 @@ import tls.x509
 pub type Kex =
     | X25519Kex(sec: crypto.X25519Secret, share: List[u8])
     | P256Kex(sec: crypto.P256Secret, share: List[u8])
+    | P384Kex(sec: crypto.EcSecret, share: List[u8])
 
 pub fn supported(group: u32) -> bool {
-    group == handshake.GROUP_X25519 || group == handshake.GROUP_SECP256R1
+    group == handshake.GROUP_X25519 || group == handshake.GROUP_SECP256R1 || group == handshake.GROUP_SECP384R1
 }
 
 pub fn group_of(k: Kex) -> u32 {
     match k {
         X25519Kex(_, _) => handshake.GROUP_X25519
         P256Kex(_, _) => handshake.GROUP_SECP256R1
+        P384Kex(_, _) => handshake.GROUP_SECP384R1
     }
 }
 
@@ -27,6 +30,7 @@ pub fn share_of(k: Kex) -> List[u8] {
     match k {
         X25519Kex(_, s) => s
         P256Kex(_, s) => s
+        P384Kex(_, s) => s
     }
 }
 
@@ -42,14 +46,20 @@ pub fn generate(group: u32) -> Result[Kex, crypto.Error] uses io {
         let pk = crypto.p256_public(sk)?
         return Ok(P256Kex(sk, pk.bytes))
     }
+    if group == handshake.GROUP_SECP384R1 {
+        let sk = crypto.ec_generate(crypto.P384)?
+        let pk = crypto.ec_public(sk)?
+        return Ok(P384Kex(sk, pk.bytes))
+    }
     Err(crypto.Unsupported)
 }
 
-/// Is `data` a well-formed share for `group` (the right length; for P-256 an uncompressed
-/// point)? Whether a P-256 point is on the curve is checked when it is used.
+/// Is `data` a well-formed share for `group` (the right length; for P-256 and P-384 an
+/// uncompressed point)? Whether a point is on the curve is checked when it is used.
 pub fn valid_share(group: u32, data: List[u8]) -> bool {
     if group == handshake.GROUP_X25519 { return data.len() == 32 }
     if group == handshake.GROUP_SECP256R1 { return data.len() == 65 && data[0] == 4 }
+    if group == handshake.GROUP_SECP384R1 { return data.len() == 97 && data[0] == 4 }
     false
 }
 
@@ -67,63 +77,122 @@ pub fn agree(k: Kex, peer: List[u8]) -> Result[List[u8], crypto.Error] {
             let s = crypto.p256_agree(sec, p)?
             Ok(s.bytes)
         }
+        P384Kex(sec, _) => {
+            let p = crypto.ec_public_key(crypto.P384, peer)?
+            let s = crypto.ec_agree(sec, p)?
+            Ok(s.bytes)
+        }
     }
 }
 
 // ------------------------------------------------------------------ signatures
 
-/// The signature scheme code for a private key.
-pub fn scheme_of(key: keyfile.SigningKey) -> u32 {
-    match key {
-        keyfile.EdKey(_) => handshake.SIG_ED25519
-        keyfile.EcKey(_) => handshake.SIG_ECDSA_SECP256R1_SHA256
-    }
+/// The signature schemes offered in signature_algorithms and CertificateRequest: the ones
+/// CertificateVerify may use, then the RSA PKCS#1 ones, which are for certificates only.
+pub fn sigalgs() -> List[u32] {
+    let mut l: List[u32] = List.new()
+    l.push(handshake.SIG_ED25519)
+    l.push(handshake.SIG_ECDSA_SECP256R1_SHA256)
+    l.push(handshake.SIG_ECDSA_SECP384R1_SHA384)
+    l.push(handshake.SIG_RSA_PSS_RSAE_SHA256)
+    l.push(handshake.SIG_RSA_PSS_RSAE_SHA384)
+    l.push(handshake.SIG_RSA_PSS_RSAE_SHA512)
+    l.push(handshake.SIG_RSA_PKCS1_SHA256)
+    l.push(handshake.SIG_RSA_PKCS1_SHA384)
+    l.push(handshake.SIG_RSA_PKCS1_SHA512)
+    l
 }
 
-/// Signs `content` (Ed25519 over the bytes themselves; ECDSA with SHA-256).
-pub fn sign(key: keyfile.SigningKey, content: List[u8]) -> Result[List[u8], crypto.Error] uses io {
+/// May `alg` sign a CertificateVerify? (RFC 8446 section 4.2.3: not the rsa_pkcs1_* schemes, which are
+/// only for certificates.)
+pub fn handshake_scheme(alg: u32) -> bool {
+    alg != handshake.SIG_RSA_PKCS1_SHA256 && alg != handshake.SIG_RSA_PKCS1_SHA384 && alg != handshake.SIG_RSA_PKCS1_SHA512
+}
+
+fn contains(xs: List[u32], x: u32) -> bool {
+    for y in xs {
+        if y == x { return true }
+    }
+    false
+}
+
+/// The schemes `key` can sign CertificateVerify with, in the order the server prefers them
+/// (TLS 1.3 ties ECDSA to the curve and uses PSS for RSA keys).
+pub fn schemes_of(key: keyfile.SigningKey) -> List[u32] {
+    let mut l: List[u32] = List.new()
+    match key {
+        keyfile.EdKey(_) => l.push(handshake.SIG_ED25519)
+        keyfile.EcKey(sec) => {
+            match sec.curve {
+                crypto.P256 => l.push(handshake.SIG_ECDSA_SECP256R1_SHA256)
+                crypto.P384 => l.push(handshake.SIG_ECDSA_SECP384R1_SHA384)
+            }
+        }
+        keyfile.RsaSigKey(_) => {
+            l.push(handshake.SIG_RSA_PSS_RSAE_SHA256)
+            l.push(handshake.SIG_RSA_PSS_RSAE_SHA384)
+            l.push(handshake.SIG_RSA_PSS_RSAE_SHA512)
+        }
+    }
+    l
+}
+
+/// The scheme to sign with: the first of `schemes_of(key)` that the peer listed.
+pub fn pick_scheme(key: keyfile.SigningKey, peer: List[u32]) -> Option[u32] {
+    for s in schemes_of(key) {
+        if contains(peer, s) { return Some(s) }
+    }
+    None
+}
+
+fn rsa_hash(alg: u32) -> Option[crypto.Hash] {
+    if alg == handshake.SIG_RSA_PSS_RSAE_SHA256 { return Some(crypto.Sha256) }
+    if alg == handshake.SIG_RSA_PSS_RSAE_SHA384 { return Some(crypto.Sha384) }
+    if alg == handshake.SIG_RSA_PSS_RSAE_SHA512 { return Some(crypto.Sha512) }
+    None
+}
+
+/// Signs `content` with scheme `alg` (one of `schemes_of(key)`): Ed25519 over the bytes
+/// themselves, ECDSA with the scheme's hash, RSASSA-PSS with a salt as long as the hash.
+pub fn sign(key: keyfile.SigningKey, alg: u32, content: List[u8]) -> Result[List[u8], crypto.Error] uses io {
+    if !contains(schemes_of(key), alg) { return Err(crypto.Unsupported) }
     match key {
         keyfile.EdKey(seed) => {
             let s = crypto.ed25519_sign(seed, content)?
             Ok(s.bytes)
         }
         keyfile.EcKey(sec) => {
-            let s = crypto.p256_sign(sec, content)?
+            let h = if alg == handshake.SIG_ECDSA_SECP384R1_SHA384 { crypto.Sha384 } else { crypto.Sha256 }
+            let s = crypto.ec_sign(sec, h, content)?
             Ok(s.der)
+        }
+        keyfile.RsaSigKey(sk) => {
+            let h = match rsa_hash(alg) {
+                Some(x) => x
+                None => return Err(crypto.Unsupported)
+            }
+            let s = crypto.rsa_pss_sign_tls(sk, h, content)?
+            Ok(s.bytes)
         }
     }
 }
 
-/// Does `sig` verify over `content` under the certificate's key, with scheme `alg`? The
-/// scheme must match the key's type.
+/// Does `sig` verify over `content` under the certificate's key, with CertificateVerify
+/// scheme `alg`? The scheme must match the key's type (and for ECDSA its curve); the RSA PKCS#1
+/// schemes are never valid here.
 pub fn verify(cert: x509.Cert, alg: u32, content: List[u8], sig: List[u8]) -> bool {
-    if alg == handshake.SIG_ED25519 {
-        match cert.key_kind {
-            x509.Ed25519Key => {
-                let pk = match crypto.ed25519_public_key(cert.key) {
-                    Ok(k) => k
-                    Err(_) => return false
-                }
-                let sg = match crypto.ed25519_signature(sig) {
-                    Ok(s) => s
-                    Err(_) => return false
-                }
-                return crypto.ed25519_verify(pk, content, sg)
-            }
-            _ => return false
-        }
-    }
+    if alg == handshake.SIG_ED25519 { return x509.verify_with(cert, x509.SigEd25519, content, sig) }
     if alg == handshake.SIG_ECDSA_SECP256R1_SHA256 {
-        match cert.key_kind {
-            x509.P256Key => {
-                let pk = match crypto.p256_public_key(cert.key) {
-                    Ok(k) => k
-                    Err(_) => return false
-                }
-                return crypto.p256_verify(pk, content, crypto.p256_signature_der(sig))
-            }
-            _ => return false
-        }
+        return cert.key_kind == x509.P256Key && x509.verify_with(cert, x509.SigEcdsa(crypto.Sha256), content, sig)
     }
-    false
+    if alg == handshake.SIG_ECDSA_SECP384R1_SHA384 {
+        return cert.key_kind == x509.P384Key && x509.verify_with(cert, x509.SigEcdsa(crypto.Sha384), content, sig)
+    }
+    match rsa_hash(alg) {
+        Some(h) => {
+            // rsa_pss_rsae_*: an rsaEncryption key, PSS with MGF1 of the same hash, salt = hash length
+            x509.verify_with(cert, x509.SigRsaPss(h, crypto.hash_len(h)), content, sig)
+        }
+        None => false
+    }
 }

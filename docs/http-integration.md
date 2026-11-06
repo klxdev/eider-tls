@@ -42,7 +42,7 @@ with these operations, each a `match` over the two forms:
 
 client.ei has four transport calls. The `https` scheme dials, runs `client.connect` with
 `client_config(host, roots)` (roots: `x509.system_store()` or a configured store; ALPN `http/1.1`), and holds a
-`Transport.Secure`. Note the RSA gap: most public sites cannot be reached until the crypto package has RSA.
+`Transport.Secure`. RSA and P-384 chains now verify (SHA-1 signed chains do not).
 
 ## WebSocket
 
